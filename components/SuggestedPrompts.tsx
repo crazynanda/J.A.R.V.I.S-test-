@@ -1,4 +1,3 @@
-
 import React from 'react';
 
 interface SuggestedPromptsProps {
@@ -8,9 +7,9 @@ interface SuggestedPromptsProps {
 
 const prompts = [
     "Give me a morning briefing.",
+    "Summarize my unread emails.",
     "Draft a reply to Alex about the meeting.",
     "My energy is low, any suggestions?",
-    "I'm heading to the airport soon."
 ];
 
 const PromptButton: React.FC<{text: string, onClick: () => void, disabled: boolean}> = ({ text, onClick, disabled }) => (

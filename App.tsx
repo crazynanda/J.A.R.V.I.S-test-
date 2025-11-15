@@ -2,10 +2,13 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { Orb } from './components/Orb';
 import { ChatInterface } from './components/ChatInterface';
-import { SuggestedPrompts } from './components/SuggestedPrompts';
-import { type ChatMessage } from './types';
-import { getAiResponse, getAiSpeech } from './services/geminiService';
+import { type ChatMessage, type ServiceIntegration } from './types';
+import { getAiResponse, getAiSpeech, getAiResponseAfterConsent } from './services/geminiService';
+import { getDeviceEmailAccounts } from './services/mockDataService';
 import { VoiceToggle } from './components/VoiceToggle';
+import { ConnectionsModal } from './components/ConnectionsModal';
+import { ConnectionsIcon } from './components/icons';
+import { INITIAL_INTEGRATIONS } from './constants';
 
 // --- Audio Utility Functions ---
 // Decodes a base64 string into a Uint8Array.
@@ -49,7 +52,6 @@ async function playAudio(
         const decodedBytes = decode(base64Audio);
         const audioBuffer = await decodeAudioData(decodedBytes, audioContext, 24000, 1);
         
-        // Stop any currently playing audio before starting a new one.
         if (sourceRef.current) {
             sourceRef.current.stop();
             sourceRef.current.disconnect();
@@ -60,18 +62,15 @@ async function playAudio(
         source.connect(audioContext.destination);
         source.start();
 
-        // When playback finishes, clear the reference.
         source.onended = () => {
             if (sourceRef.current === source) {
                 sourceRef.current = null;
             }
         };
-
-        // Store the new source node.
         sourceRef.current = source;
     } catch (error) {
         console.error("Error playing audio:", error);
-        sourceRef.current = null; // Ensure ref is cleared on error.
+        sourceRef.current = null;
     }
 }
 // --- End Audio Utility Functions ---
@@ -82,31 +81,35 @@ const App: React.FC = () => {
     ]);
     const [isLoading, setIsLoading] = useState(false);
     const [isVoiceOutputEnabled, setIsVoiceOutputEnabled] = useState(true);
+    const [isConnectionsModalOpen, setIsConnectionsModalOpen] = useState(false);
+    const [integrations, setIntegrations] = useState<ServiceIntegration[]>(INITIAL_INTEGRATIONS);
+    const [isInitializing, setIsInitializing] = useState(true);
+
     const audioContextRef = useRef<AudioContext | null>(null);
     const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
-    // Function to stop any currently playing audio.
-    const stopAudio = useCallback(() => {
+    // Unchanged from before
+    const stopAudioInternal = useCallback(() => {
         if (audioSourceRef.current) {
             try {
                 audioSourceRef.current.stop();
             } catch (e) {
-                // Ignore errors if the source has already been stopped
+                // Ignore errors
             }
             audioSourceRef.current.disconnect();
             audioSourceRef.current = null;
         }
     }, []);
 
-    // Initialize AudioContext on component mount and handle browser autoplay policies.
     useEffect(() => {
+        // ... audio context initialization as before ...
         if (!audioContextRef.current) {
             try {
                 const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
                 audioContextRef.current = new AudioContext({ sampleRate: 24000 });
             } catch (error) {
                 console.error("Could not create AudioContext:", error);
-                setIsVoiceOutputEnabled(false); // Disable if not supported
+                setIsVoiceOutputEnabled(false);
             }
         }
         
@@ -118,78 +121,144 @@ const App: React.FC = () => {
         };
         window.addEventListener('click', resumeAudio, true);
 
+        // Simulate real-time discovery of device accounts
+        const initializeApp = async () => {
+            setIsInitializing(true);
+            try {
+                const discoveredAccounts = await getDeviceEmailAccounts();
+                setIntegrations(prevIntegrations =>
+                    prevIntegrations.map(int => {
+                        if (int.id === 'email') {
+                            return {
+                                ...int,
+                                accounts: discoveredAccounts.map(acc => ({ id: acc.id, connected: false }))
+                            };
+                        }
+                        return int;
+                    })
+                );
+            } catch (error) {
+                console.error("Failed to discover device accounts:", error);
+            } finally {
+                setIsInitializing(false);
+            }
+        };
+
+        initializeApp();
+
         return () => {
             window.removeEventListener('click', resumeAudio, true);
-            stopAudio(); // Cleanup audio on unmount
+            stopAudioInternal();
         };
-    }, [stopAudio]);
+    }, [stopAudioInternal]);
+
+    const playAiSpeech = useCallback(async (text: string) => {
+        if (!isVoiceOutputEnabled || !audioContextRef.current) return;
+        try {
+            const base64Audio = await getAiSpeech(text);
+            if (base64Audio && audioContextRef.current) {
+                await playAudio(base64Audio, audioContextRef.current, audioSourceRef);
+            }
+        } catch (error) {
+            console.error("Failed to play AI speech:", error);
+        }
+    }, [isVoiceOutputEnabled]);
 
     const handleSendMessage = useCallback(async (text: string) => {
         if (!text.trim()) return;
-
-        stopAudio(); // Stop any previous speech when a new message is sent.
-
+        stopAudioInternal();
         const userMessage: ChatMessage = { author: 'user', text };
         setMessages(prev => [...prev, userMessage]);
         setIsLoading(true);
 
         try {
-            // 1. Get the AI's text response first.
-            const aiResponseText = await getAiResponse(text, messages);
-            
-            let audioPromise: Promise<string | null> = Promise.resolve(null);
-
-            // 2. If voice is enabled, start fetching the audio *before* showing the text.
-            if (isVoiceOutputEnabled && audioContextRef.current) {
-                audioPromise = getAiSpeech(aiResponseText).catch(speechError => {
-                    console.error("Failed to get AI speech:", speechError);
-                    return null; // Don't let a speech failure block the message.
-                });
-            }
-
-            // 3. Wait for the audio to be fetched.
-            const base64Audio = await audioPromise;
-
-            // 4. Now that we have both, update the UI and play audio simultaneously.
-            const aiMessage: ChatMessage = { author: 'ai', text: aiResponseText };
+            const aiResponse = await getAiResponse(text, messages, integrations);
+            const aiMessage: ChatMessage = { 
+                author: 'ai', 
+                text: aiResponse.text,
+                requiresConsent: aiResponse.requiresConsent,
+                action: aiResponse.action,
+            };
             setMessages(prev => [...prev, aiMessage]);
-
-            if (base64Audio && audioContextRef.current) {
-                await playAudio(base64Audio, audioContextRef.current, audioSourceRef);
+            
+            // Only speak non-consent messages
+            if (!aiResponse.requiresConsent) {
+                await playAiSpeech(aiResponse.text);
             }
-
         } catch (error) {
             console.error("Error getting AI response:", error);
-            const errorMessage: ChatMessage = {
-                author: 'ai',
-                text: "I'm sorry, I encountered an error. Please try again later."
-            };
+            const errorMessage: ChatMessage = { author: 'ai', text: "I'm sorry, I encountered an error." };
             setMessages(prev => [...prev, errorMessage]);
+            await playAiSpeech(errorMessage.text);
         } finally {
             setIsLoading(false);
         }
-    }, [messages, isVoiceOutputEnabled, stopAudio]);
+    }, [messages, integrations, stopAudioInternal, playAiSpeech]);
+
+    const handleConsent = useCallback(async (messageToApprove: ChatMessage) => {
+        if (!messageToApprove.action) return;
+        stopAudioInternal();
+        setMessages(prev => prev.map(m => m === messageToApprove ? { ...m, consentGranted: true, text: `${m.text}\n\n*Access granted. Proceeding...*` } : m));
+        setIsLoading(true);
+
+        const historyUpToConsentRequest = messages.slice(0, messages.indexOf(messageToApprove) + 1);
+
+        try {
+            const aiResponse = await getAiResponseAfterConsent(messageToApprove.action, historyUpToConsentRequest, integrations);
+            const aiMessage: ChatMessage = { author: 'ai', text: aiResponse.text };
+            setMessages(prev => [...prev, aiMessage]);
+            await playAiSpeech(aiResponse.text);
+        } catch (error) {
+            console.error("Error getting AI response after consent:", error);
+            const errorMessage: ChatMessage = { author: 'ai', text: "Thank you. However, I encountered an error while proceeding." };
+            setMessages(prev => [...prev, errorMessage]);
+            await playAiSpeech(errorMessage.text);
+        } finally {
+            setIsLoading(false);
+        }
+    }, [messages, integrations, stopAudioInternal, playAiSpeech]);
 
     const handleToggleVoice = useCallback(() => {
-        const wasEnabled = isVoiceOutputEnabled;
-        const willBeEnabled = !wasEnabled;
-        
-        // If turning voice off, stop any currently playing audio.
-        if (wasEnabled && !willBeEnabled) {
-            stopAudio();
-        }
-        setIsVoiceOutputEnabled(willBeEnabled);
-    }, [isVoiceOutputEnabled, stopAudio]);
+        setIsVoiceOutputEnabled(prev => {
+            if (prev) stopAudioInternal();
+            return !prev;
+        });
+    }, [stopAudioInternal]);
+
+    const handleToggleIntegration = useCallback((id: string, accountId?: string) => {
+        setIntegrations(prev => prev.map(int => {
+            if (int.id !== id) return int;
+
+            // Handle services with multiple accounts, like email
+            if (accountId && int.accounts) {
+                const newAccounts = int.accounts.map(acc => 
+                    acc.id === accountId ? { ...acc, connected: !acc.connected } : acc
+                );
+                const isAnyAccountConnected = newAccounts.some(acc => acc.connected);
+                return { ...int, accounts: newAccounts, connected: isAnyAccountConnected };
+            }
+
+            // Handle simple toggle for other services
+            return { ...int, connected: !int.connected };
+        }));
+    }, []);
 
     return (
         <div className="flex flex-col h-screen bg-slate-900 text-slate-100 p-4 md:p-6 overflow-hidden">
             <header className="flex-shrink-0 flex items-center justify-center text-center py-4 relative">
-                 <div className="absolute top-2 right-2">
-                    <VoiceToggle 
-                        isEnabled={isVoiceOutputEnabled} 
-                        onToggle={handleToggleVoice} 
-                        disabled={!audioContextRef.current}
-                    />
+                <div className="absolute top-2 left-2 flex items-center gap-2">
+                     <button
+                        onClick={() => setIsConnectionsModalOpen(true)}
+                        className="p-2 rounded-full text-slate-400 hover:text-cyan-400 hover:bg-slate-700/50 transition-colors focus:outline-none focus:ring-2 focus:ring-cyan-500 disabled:opacity-50 disabled:cursor-wait"
+                        aria-label="Manage Connections"
+                        title="Manage Connections"
+                        disabled={isInitializing}
+                    >
+                        <ConnectionsIcon />
+                    </button>
+                </div>
+                <div className="absolute top-2 right-2">
+                    <VoiceToggle isEnabled={isVoiceOutputEnabled} onToggle={handleToggleVoice} disabled={!audioContextRef.current} />
                 </div>
                 <div className="flex flex-col items-center">
                     <Orb isLoading={isLoading} />
@@ -199,12 +268,15 @@ const App: React.FC = () => {
             </header>
             
             <main className="flex-1 flex flex-col min-h-0">
-                <ChatInterface messages={messages} isLoading={isLoading} onSendMessage={handleSendMessage} />
+                <ChatInterface messages={messages} isLoading={isLoading} onSendMessage={handleSendMessage} onConsent={handleConsent} />
             </main>
-
-            <footer className="flex-shrink-0 pt-4">
-                <SuggestedPrompts onPromptClick={handleSendMessage} disabled={isLoading}/>
-            </footer>
+            
+            <ConnectionsModal 
+                isOpen={isConnectionsModalOpen} 
+                onClose={() => setIsConnectionsModalOpen(false)}
+                integrations={integrations}
+                onToggle={handleToggleIntegration}
+            />
         </div>
     );
 };

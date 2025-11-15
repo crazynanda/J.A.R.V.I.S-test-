@@ -1,4 +1,3 @@
-
 import React, { useRef, useEffect } from 'react';
 import { type ChatMessage } from '../types';
 import { Message } from './Message';
@@ -8,9 +7,10 @@ interface ChatInterfaceProps {
     messages: ChatMessage[];
     isLoading: boolean;
     onSendMessage: (text: string) => void;
+    onConsent: (message: ChatMessage) => void;
 }
 
-export const ChatInterface: React.FC<ChatInterfaceProps> = ({ messages, isLoading, onSendMessage }) => {
+export const ChatInterface: React.FC<ChatInterfaceProps> = ({ messages, isLoading, onSendMessage, onConsent }) => {
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const scrollToBottom = () => {
@@ -23,9 +23,22 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ messages, isLoadin
 
     return (
         <div className="flex flex-col flex-1 bg-slate-800/50 rounded-xl overflow-hidden border border-slate-700/50">
-            <div className="flex-1 p-4 md:p-6 overflow-y-auto space-y-4">
+            <div className="flex-1 p-4 md:p-6 overflow-y-auto space-y-2">
                 {messages.map((msg, index) => (
-                    <Message key={index} author={msg.author} text={msg.text} />
+                    <div key={index}>
+                        <Message author={msg.author} text={msg.text} />
+                        {msg.author === 'ai' && msg.requiresConsent && !msg.consentGranted && (
+                            <div className="flex justify-start pl-11 pt-2 animate-fade-in">
+                                <button 
+                                    onClick={() => onConsent(msg)}
+                                    disabled={isLoading}
+                                    className="text-sm font-semibold bg-cyan-500 text-white rounded-lg px-4 py-2 hover:bg-cyan-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-800 focus:ring-cyan-500 transition-colors disabled:bg-slate-600"
+                                >
+                                    Grant Access & Proceed
+                                </button>
+                            </div>
+                        )}
+                    </div>
                 ))}
                 {isLoading && messages[messages.length-1]?.author === 'user' && (
                      <Message author="ai" text="..." isLoading={true} />
