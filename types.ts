@@ -1,3 +1,4 @@
+
 // Fix: Added import for FC from react to resolve namespace error.
 import type { FC } from 'react';
 
@@ -13,6 +14,7 @@ export interface ServiceAccount {
 export interface ChatMessage {
     author: MessageAuthor;
     text: string;
+    image?: string; // Base64 encoded image data URL
     // For consent flow
     requiresConsent?: boolean;
     consentGranted?: boolean;
@@ -20,6 +22,13 @@ export interface ChatMessage {
         toolName: string;
         toolArgs: any;
     };
+}
+
+// Represents a single, continuous conversation.
+export interface ChatSession {
+    id: string;
+    lastUpdated: number;
+    messages: ChatMessage[];
 }
 
 // A structured response from the AI service

@@ -1,3 +1,4 @@
+
 import { GoogleGenAI, Modality, type Content, GenerateContentResponse, Tool, Part, Type } from "@google/genai";
 import { type ChatMessage, type AiResponse, type ServiceIntegration } from '../types';
 import { AI_PERSONA_INSTRUCTIONS, generateLifeStateGraph } from '../constants';
@@ -34,27 +35,49 @@ const tools: Tool[] = [{
     ]
 }];
 
+/**
+ * Creates a Part object for an image from a data URL.
+ * @param imageDataUrl The base64 encoded image data URL.
+ * @returns A Part object for the Gemini API or null if the format is invalid.
+ */
+function getImagePart(imageDataUrl: string): Part | null {
+    const match = imageDataUrl.match(/^data:(image\/.+);base64,(.+)$/);
+    if (!match) {
+        console.error("Invalid image data URL format");
+        return null;
+    }
+    const mimeType = match[1];
+    const base64Data = match[2];
+    
+    return {
+        inlineData: {
+            mimeType,
+            data: base64Data
+        }
+    };
+}
+
+
 function formatHistoryForApi(history: ChatMessage[]): Content[] {
     const apiHistory: Content[] = [];
     
-    // Start with a mutable copy of the history
     let processingHistory = [...history];
 
-    // The first message from the AI is a greeting and should not be part of the history for the model.
     if (processingHistory.length > 0 && processingHistory[0].author === 'ai') {
         processingHistory.shift();
     }
 
     for (const message of processingHistory) {
         if (message.author === 'user') {
-            apiHistory.push({
-                role: 'user',
-                parts: [{ text: message.text }]
-            });
+            const parts: Part[] = [{ text: message.text }];
+            if (message.image) {
+                const imagePart = getImagePart(message.image);
+                if (imagePart) {
+                    parts.push(imagePart);
+                }
+            }
+            apiHistory.push({ role: 'user', parts });
         } else { // author === 'ai'
-            // If the AI's message was a request for consent, it originated from a function call.
-            // We need to reconstruct this function call in the history for the model's context
-            // to ensure the user/model turns are correctly alternated.
             if (message.requiresConsent && message.action) {
                 apiHistory.push({
                     role: 'model',
@@ -62,7 +85,7 @@ function formatHistoryForApi(history: ChatMessage[]): Content[] {
                         functionCall: {
                             name: 'requestPermission',
                             args: {
-                                reason: message.text, // The displayed text is the reason
+                                reason: message.text,
                                 toolToCall: message.action.toolName,
                                 toolArgs: message.action.toolArgs,
                             }
@@ -70,13 +93,11 @@ function formatHistoryForApi(history: ChatMessage[]): Content[] {
                     }]
                 });
             } else if (message.text) { 
-                // Regular AI text response.
                 apiHistory.push({
                     role: 'model',
                     parts: [{ text: message.text }]
                 });
             }
-            // Intentionally ignore malformed AI messages (e.g., no text and no action)
         }
     }
     return apiHistory;
@@ -85,16 +106,13 @@ function formatHistoryForApi(history: ChatMessage[]): Content[] {
 async function executeTool(toolName: string, toolArgs: any, connections: ServiceIntegration[]): Promise<Part> {
      if (toolName in availableTools) {
         try {
-            // Special handling for getEmails to pass connected accounts
             if (toolName === 'getEmails') {
                 const emailIntegration = connections.find(c => c.id === 'email');
                 const connectedAccounts = emailIntegration?.accounts?.filter(a => a.connected).map(a => a.id) || [];
                 
-                // If the AI didn't specify accounts, use all connected ones.
                 if (!toolArgs.accountIds || toolArgs.accountIds.length === 0) {
                     toolArgs.accountIds = connectedAccounts;
                 } else {
-                    // Security check: ensure AI only requests accounts that are actually connected
                     toolArgs.accountIds = toolArgs.accountIds.filter((id: string) => connectedAccounts.includes(id));
                 }
             }
@@ -129,26 +147,36 @@ async function executeTool(toolName: string, toolArgs: any, connections: Service
 /**
  * Gets a text response from the Gemini model, handling the consent flow and tool calls.
  * @param prompt The user's latest message.
+ * @param image Optional base64 encoded image string.
  * @param history The current chat history.
  * @param connections The current state of service integrations.
  * @returns A structured AiResponse object.
  */
 export async function getAiResponse(
     prompt: string, 
+    image: string | undefined,
     history: ChatMessage[],
     connections: ServiceIntegration[]
 ): Promise<AiResponse> {
     const chat = ai.chats.create({
         model: model,
-        tools: tools,
-        // Fix: Updated systemInstruction to be a string inside the config object per API guidelines.
         config: {
+            tools: tools,
             systemInstruction: `${AI_PERSONA_INSTRUCTIONS}\n\n${generateLifeStateGraph(connections)}`
         },
         history: formatHistoryForApi(history)
     });
 
-    const result = await chat.sendMessage({ message: prompt });
+    const userParts: Part[] = [{ text: prompt }];
+    if (image) {
+        const imagePart = getImagePart(image);
+        if (imagePart) {
+            userParts.push(imagePart);
+        }
+    }
+
+    // Fix: chat.sendMessage expects an object with a `message` property.
+    const result = await chat.sendMessage({ message: userParts });
     const response = result;
     const functionCall = response.functionCalls?.[0];
 
@@ -156,17 +184,18 @@ export async function getAiResponse(
         if (functionCall.name === 'requestPermission') {
             console.log("AI is requesting permission:", functionCall.args);
             return {
-                text: functionCall.args.reason,
+                text: functionCall.args.reason as string,
                 requiresConsent: true,
                 action: {
-                    toolName: functionCall.args.toolToCall,
+                    toolName: functionCall.args.toolToCall as string,
                     toolArgs: functionCall.args.toolArgs || {}
                 }
             };
         } else {
             console.log("AI wants to call a tool directly:", functionCall);
             const functionResponsePart = await executeTool(functionCall.name, functionCall.args, connections);
-            const secondResult = await chat.sendMessage({ toolResponses: [functionResponsePart] });
+            // Fix: chat.sendMessage expects an object with a `message` property.
+            const secondResult = await chat.sendMessage({ message: [functionResponsePart] });
             return { text: secondResult.text };
         }
     } else {
@@ -189,9 +218,8 @@ export async function getAiResponseAfterConsent(
 ): Promise<AiResponse> {
     const chat = ai.chats.create({
         model: model,
-        tools: tools,
-        // Fix: Updated systemInstruction to be a string inside the config object per API guidelines.
         config: {
+            tools: tools,
             systemInstruction: `${AI_PERSONA_INSTRUCTIONS}\n\n${generateLifeStateGraph(connections)}`
         },
         history: formatHistoryForApi(history)
@@ -199,7 +227,8 @@ export async function getAiResponseAfterConsent(
 
     console.log("Executing tool after consent:", action);
     const functionResponsePart = await executeTool(action.toolName, action.toolArgs, connections);
-    const result = await chat.sendMessage({ toolResponses: [functionResponsePart] });
+    // Fix: chat.sendMessage expects an object with a `message` property.
+    const result = await chat.sendMessage({ message: [functionResponsePart] });
 
     return { text: result.text };
 }

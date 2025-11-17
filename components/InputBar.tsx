@@ -1,8 +1,9 @@
-
 import React, { useState, useRef, useEffect } from 'react';
+import { CameraIcon, ImageIcon } from './icons';
+import { CameraView } from './CameraView';
 
 interface InputBarProps {
-    onSendMessage: (text: string) => void;
+    onSendMessage: (text: string, image?: string) => void;
     isLoading: boolean;
 }
 
@@ -22,6 +23,12 @@ export const InputBar: React.FC<InputBarProps> = ({ onSendMessage, isLoading }) 
     const [isSupported, setIsSupported] = useState(false);
     const [micError, setMicError] = useState<string | null>(null);
     const recognitionRef = useRef<any>(null);
+    const isAbortingRef = useRef<boolean>(false);
+    const fileInputRef = useRef<HTMLInputElement>(null);
+    
+    const [isCameraOpen, setIsCameraOpen] = useState(false);
+    const [capturedImage, setCapturedImage] = useState<string | null>(null);
+
 
     useEffect(() => {
         const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -36,10 +43,12 @@ export const InputBar: React.FC<InputBarProps> = ({ onSendMessage, isLoading }) 
             recognition.onstart = () => {
                 setIsRecording(true);
                 setMicError(null); // Clear any previous errors on successful start
+                isAbortingRef.current = false; // Reset abort flag on new session
             };
 
             recognition.onend = () => {
                 setIsRecording(false);
+                isAbortingRef.current = false; // Reset abort flag
             };
 
             recognition.onerror = (event: any) => {
@@ -72,6 +81,9 @@ export const InputBar: React.FC<InputBarProps> = ({ onSendMessage, isLoading }) 
             };
 
             recognition.onresult = (event: any) => {
+                // If we've flagged for abort, ignore any trailing results
+                if (isAbortingRef.current) return;
+
                 // Stitch together the full transcript from all results
                 const transcript = Array.from(event.results)
                     .map((result: any) => result[0])
@@ -111,9 +123,10 @@ export const InputBar: React.FC<InputBarProps> = ({ onSendMessage, isLoading }) 
     
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
-        if (inputValue.trim() && !isLoading) {
-            onSendMessage(inputValue);
+        if ((inputValue.trim() || capturedImage) && !isLoading) {
+            onSendMessage(inputValue, capturedImage ?? undefined);
             setInputValue('');
+            setCapturedImage(null);
             if (isRecording && recognitionRef.current) {
                 recognitionRef.current.stop();
             }
@@ -125,10 +138,42 @@ export const InputBar: React.FC<InputBarProps> = ({ onSendMessage, isLoading }) 
         if (micError) {
             setMicError(null); // Clear error when user types
         }
-        // If the user starts typing, stop the recording to allow for manual editing.
-        // This provides a seamless way to correct the dictated text.
+        // If the user starts typing, abort the recording to allow for manual editing.
+        // This provides a seamless way to correct the dictated text without overwriting.
         if (isRecording && recognitionRef.current) {
-            recognitionRef.current.stop();
+            isAbortingRef.current = true; // Set flag to ignore any further results
+            recognitionRef.current.abort();
+        }
+    };
+    
+    const handleCapture = (imageDataUrl: string) => {
+        setCapturedImage(imageDataUrl);
+        setIsCameraOpen(false);
+    };
+
+    const handleUploadClick = () => {
+        fileInputRef.current?.click();
+    };
+
+    const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        if (file) {
+            if (!file.type.startsWith('image/')) {
+                console.error("Invalid file type. Please upload an image.");
+                // Optionally set an error state to show in the UI
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                if (typeof e.target?.result === 'string') {
+                    setCapturedImage(e.target.result);
+                }
+            };
+            reader.readAsDataURL(file);
+        }
+        // Reset file input value to allow re-uploading the same file
+        if (event.target) {
+            event.target.value = '';
         }
     };
 
@@ -140,7 +185,45 @@ export const InputBar: React.FC<InputBarProps> = ({ onSendMessage, isLoading }) 
 
     return (
         <div>
+            {capturedImage && (
+                <div className="relative inline-block mb-2">
+                    <img src={capturedImage} alt="capture preview" className="h-16 w-16 rounded-lg object-cover" />
+                    <button
+                        onClick={() => setCapturedImage(null)}
+                        className="absolute -top-2 -right-2 bg-slate-700 text-white rounded-full h-6 w-6 flex items-center justify-center text-xs font-bold hover:bg-red-500 transition-colors"
+                        aria-label="Remove image"
+                    >
+                        &times;
+                    </button>
+                </div>
+            )}
             <form onSubmit={handleSubmit} className="flex items-center gap-2">
+                 <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handleFileChange}
+                    accept="image/*"
+                    className="hidden"
+                    aria-hidden="true"
+                 />
+                 <button
+                    type="button"
+                    onClick={handleUploadClick}
+                    disabled={isLoading}
+                    className="p-2 text-slate-400 hover:text-cyan-400 transition-colors disabled:opacity-50"
+                    aria-label="Upload image"
+                 >
+                    <ImageIcon />
+                </button>
+                 <button
+                    type="button"
+                    onClick={() => setIsCameraOpen(true)}
+                    disabled={isLoading}
+                    className="p-2 text-slate-400 hover:text-cyan-400 transition-colors disabled:opacity-50"
+                    aria-label="Open camera"
+                >
+                    <CameraIcon />
+                </button>
                 <button 
                     type="button" 
                     onClick={handleMicClick}
@@ -148,7 +231,7 @@ export const InputBar: React.FC<InputBarProps> = ({ onSendMessage, isLoading }) 
                     className={micButtonClasses}
                     aria-label={isRecording ? "Stop recording" : "Start recording"}
                 >
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill={isRecording ? "currentColor" : "none"} viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
                     </svg>
                 </button>
@@ -156,13 +239,13 @@ export const InputBar: React.FC<InputBarProps> = ({ onSendMessage, isLoading }) 
                     type="text"
                     value={inputValue}
                     onChange={handleInputChange}
-                    placeholder={isRecording ? "Listening..." : "Ask J.A.R.V.I.S anything..."}
+                    placeholder={capturedImage ? "Add a caption..." : (isRecording ? "Listening..." : "Ask J.A.R.V.I.S anything...")}
                     disabled={isLoading}
                     className="flex-1 bg-slate-900/80 border border-slate-600 rounded-lg px-4 py-2 text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 transition-all"
                 />
                 <button
                     type="submit"
-                    disabled={isLoading || !inputValue.trim()}
+                    disabled={isLoading || (!inputValue.trim() && !capturedImage)}
                     className="bg-cyan-500 text-white font-semibold rounded-lg px-4 py-2 hover:bg-cyan-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-cyan-500 transition-colors disabled:bg-slate-600 disabled:cursor-not-allowed"
                 >
                     Send
@@ -173,6 +256,11 @@ export const InputBar: React.FC<InputBarProps> = ({ onSendMessage, isLoading }) 
                     {micError}
                 </p>
             )}
+            <CameraView 
+                isOpen={isCameraOpen}
+                onClose={() => setIsCameraOpen(false)}
+                onCapture={handleCapture}
+            />
         </div>
     );
 };

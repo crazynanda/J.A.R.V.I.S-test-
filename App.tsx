@@ -1,14 +1,19 @@
 
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { Orb } from './components/Orb';
 import { ChatInterface } from './components/ChatInterface';
-import { type ChatMessage, type ServiceIntegration } from './types';
+import { ChatHistoryPanel } from './components/ChatHistoryPanel';
+import { type ChatMessage, type ServiceIntegration, type ChatSession } from './types';
 import { getAiResponse, getAiSpeech, getAiResponseAfterConsent } from './services/geminiService';
 import { getDeviceEmailAccounts } from './services/mockDataService';
 import { VoiceToggle } from './components/VoiceToggle';
 import { ConnectionsModal } from './components/ConnectionsModal';
-import { ConnectionsIcon } from './components/icons';
-import { INITIAL_INTEGRATIONS } from './constants';
+import { ConnectionsIcon, HistoryIcon } from './components/icons';
+import { INITIAL_INTEGRATIONS, INITIAL_MESSAGE } from './constants';
+
+// --- Local Storage Keys ---
+const CHAT_SESSIONS_KEY = 'jarvis-chat-sessions';
+const VOICE_ENABLED_KEY = 'jarvis-voice-enabled';
 
 // --- Audio Utility Functions ---
 // Decodes a base64 string into a Uint8Array.
@@ -76,33 +81,87 @@ async function playAudio(
 // --- End Audio Utility Functions ---
 
 const App: React.FC = () => {
-    const [messages, setMessages] = useState<ChatMessage[]>([
-        { author: 'ai', text: "Hello. I'm J.A.R.V.I.S, your personal AI assistant. How can I help you organize your day?" }
-    ]);
+    const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
+    const [activeChatId, setActiveChatId] = useState<string | null>(null);
     const [isLoading, setIsLoading] = useState(false);
-    const [isVoiceOutputEnabled, setIsVoiceOutputEnabled] = useState(true);
+    const [isVoiceOutputEnabled, setIsVoiceOutputEnabled] = useState(() => {
+        try {
+            const saved = localStorage.getItem(VOICE_ENABLED_KEY);
+            return saved !== 'false'; // Default to true if not found or not 'false'
+        } catch (error) {
+            console.error('Failed to load voice setting:', error);
+            return true;
+        }
+    });
     const [isConnectionsModalOpen, setIsConnectionsModalOpen] = useState(false);
+    const [isHistoryPanelOpen, setIsHistoryPanelOpen] = useState(false);
     const [integrations, setIntegrations] = useState<ServiceIntegration[]>(INITIAL_INTEGRATIONS);
     const [isInitializing, setIsInitializing] = useState(true);
 
     const audioContextRef = useRef<AudioContext | null>(null);
     const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
-    // Unchanged from before
+    // Load sessions from localStorage on initial render
+    useEffect(() => {
+        try {
+            const savedSessions = localStorage.getItem(CHAT_SESSIONS_KEY);
+            if (savedSessions) {
+                const sessions = JSON.parse(savedSessions) as ChatSession[];
+                if (sessions.length > 0) {
+                    setChatSessions(sessions);
+                    // Set the most recently updated chat as active
+                    setActiveChatId(sessions.sort((a, b) => b.lastUpdated - a.lastUpdated)[0].id);
+                } else {
+                    handleNewChat(); // Create a new chat if storage is empty
+                }
+            } else {
+                handleNewChat(); // Create a new chat if no storage found
+            }
+        } catch (error) {
+            console.error('Failed to load chat history:', error);
+            handleNewChat(); // Start fresh if loading fails
+        }
+    }, []);
+
+    // Save sessions to localStorage whenever they change
+    useEffect(() => {
+        // Avoid clearing storage on the initial empty state
+        if (isInitializing && chatSessions.length === 0) return;
+        try {
+             if (chatSessions.length > 0) {
+                localStorage.setItem(CHAT_SESSIONS_KEY, JSON.stringify(chatSessions));
+            } else {
+                // If there are no sessions, remove the key from storage
+                localStorage.removeItem(CHAT_SESSIONS_KEY);
+            }
+        } catch (error) {
+            console.error('Failed to save chat history:', error);
+        }
+    }, [chatSessions, isInitializing]);
+
+    const activeChat = useMemo(() => {
+        return chatSessions.find(chat => chat.id === activeChatId);
+    }, [chatSessions, activeChatId]);
+
     const stopAudioInternal = useCallback(() => {
         if (audioSourceRef.current) {
             try {
                 audioSourceRef.current.stop();
-            } catch (e) {
-                // Ignore errors
-            }
+            } catch (e) { /* Ignore errors */ }
             audioSourceRef.current.disconnect();
             audioSourceRef.current = null;
         }
     }, []);
+    
+    useEffect(() => {
+        try {
+            localStorage.setItem(VOICE_ENABLED_KEY, String(isVoiceOutputEnabled));
+        } catch (error) {
+            console.error('Failed to save voice setting:', error);
+        }
+    }, [isVoiceOutputEnabled]);
 
     useEffect(() => {
-        // ... audio context initialization as before ...
         if (!audioContextRef.current) {
             try {
                 const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
@@ -121,7 +180,6 @@ const App: React.FC = () => {
         };
         window.addEventListener('click', resumeAudio, true);
 
-        // Simulate real-time discovery of device accounts
         const initializeApp = async () => {
             setIsInitializing(true);
             try {
@@ -163,60 +221,72 @@ const App: React.FC = () => {
             console.error("Failed to play AI speech:", error);
         }
     }, [isVoiceOutputEnabled]);
+    
+    const updateActiveChat = (updater: (prevMessages: ChatMessage[]) => ChatMessage[]) => {
+        setChatSessions(prevSessions =>
+            prevSessions.map(session =>
+                session.id === activeChatId
+                    ? { ...session, messages: updater(session.messages), lastUpdated: Date.now() }
+                    : session
+            )
+        );
+    };
 
-    const handleSendMessage = useCallback(async (text: string) => {
-        if (!text.trim()) return;
+    const handleSendMessage = useCallback(async (text: string, image?: string) => {
+        if (!text.trim() && !image) return;
+        if (!activeChat) return;
+
         stopAudioInternal();
-        const userMessage: ChatMessage = { author: 'user', text };
-        setMessages(prev => [...prev, userMessage]);
+        const userMessage: ChatMessage = { author: 'user', text, image };
+        updateActiveChat(prev => [...prev, userMessage]);
         setIsLoading(true);
 
         try {
-            const aiResponse = await getAiResponse(text, messages, integrations);
+            const aiResponse = await getAiResponse(text, image, activeChat.messages, integrations);
             const aiMessage: ChatMessage = { 
                 author: 'ai', 
                 text: aiResponse.text,
                 requiresConsent: aiResponse.requiresConsent,
                 action: aiResponse.action,
             };
-            setMessages(prev => [...prev, aiMessage]);
+            updateActiveChat(prev => [...prev, aiMessage]);
             
-            // Only speak non-consent messages
             if (!aiResponse.requiresConsent) {
                 await playAiSpeech(aiResponse.text);
             }
         } catch (error) {
             console.error("Error getting AI response:", error);
             const errorMessage: ChatMessage = { author: 'ai', text: "I'm sorry, I encountered an error." };
-            setMessages(prev => [...prev, errorMessage]);
+            updateActiveChat(prev => [...prev, errorMessage]);
             await playAiSpeech(errorMessage.text);
         } finally {
             setIsLoading(false);
         }
-    }, [messages, integrations, stopAudioInternal, playAiSpeech]);
+    }, [activeChat, integrations, stopAudioInternal, playAiSpeech, activeChatId]);
 
     const handleConsent = useCallback(async (messageToApprove: ChatMessage) => {
-        if (!messageToApprove.action) return;
+        if (!messageToApprove.action || !activeChat) return;
         stopAudioInternal();
-        setMessages(prev => prev.map(m => m === messageToApprove ? { ...m, consentGranted: true, text: `${m.text}\n\n*Access granted. Proceeding...*` } : m));
+        
+        updateActiveChat(prev => prev.map(m => m === messageToApprove ? { ...m, consentGranted: true, text: `${m.text}\n\n*Access granted. Proceeding...*` } : m));
         setIsLoading(true);
 
-        const historyUpToConsentRequest = messages.slice(0, messages.indexOf(messageToApprove) + 1);
+        const historyUpToConsentRequest = activeChat.messages.slice(0, activeChat.messages.indexOf(messageToApprove) + 1);
 
         try {
             const aiResponse = await getAiResponseAfterConsent(messageToApprove.action, historyUpToConsentRequest, integrations);
             const aiMessage: ChatMessage = { author: 'ai', text: aiResponse.text };
-            setMessages(prev => [...prev, aiMessage]);
+            updateActiveChat(prev => [...prev, aiMessage]);
             await playAiSpeech(aiResponse.text);
         } catch (error) {
             console.error("Error getting AI response after consent:", error);
             const errorMessage: ChatMessage = { author: 'ai', text: "Thank you. However, I encountered an error while proceeding." };
-            setMessages(prev => [...prev, errorMessage]);
+            updateActiveChat(prev => [...prev, errorMessage]);
             await playAiSpeech(errorMessage.text);
         } finally {
             setIsLoading(false);
         }
-    }, [messages, integrations, stopAudioInternal, playAiSpeech]);
+    }, [activeChat, integrations, stopAudioInternal, playAiSpeech, activeChatId]);
 
     const handleToggleVoice = useCallback(() => {
         setIsVoiceOutputEnabled(prev => {
@@ -229,7 +299,6 @@ const App: React.FC = () => {
         setIntegrations(prev => prev.map(int => {
             if (int.id !== id) return int;
 
-            // Handle services with multiple accounts, like email
             if (accountId && int.accounts) {
                 const newAccounts = int.accounts.map(acc => 
                     acc.id === accountId ? { ...acc, connected: !acc.connected } : acc
@@ -238,15 +307,77 @@ const App: React.FC = () => {
                 return { ...int, accounts: newAccounts, connected: isAnyAccountConnected };
             }
 
-            // Handle simple toggle for other services
             return { ...int, connected: !int.connected };
         }));
     }, []);
 
+    const handleNewChat = useCallback(() => {
+        const newChat: ChatSession = {
+            id: Date.now().toString(),
+            lastUpdated: Date.now(),
+            messages: [INITIAL_MESSAGE],
+        };
+        setChatSessions(prev => [newChat, ...prev]);
+        setActiveChatId(newChat.id);
+        setIsHistoryPanelOpen(false);
+    }, []);
+
+    const handleSelectChat = useCallback((id: string) => {
+        setActiveChatId(id);
+        setIsHistoryPanelOpen(false);
+    }, []);
+
+    const handleDeleteChat = useCallback((idToDelete: string) => {
+        setChatSessions(prev => {
+            const remainingSessions = prev.filter(s => s.id !== idToDelete);
+            // If the deleted chat was the active one, switch to the newest chat or create one
+            if (activeChatId === idToDelete) {
+                if (remainingSessions.length > 0) {
+                    setActiveChatId(remainingSessions.sort((a, b) => b.lastUpdated - a.lastUpdated)[0].id);
+                } else {
+                    // This path will be handled by the logic below
+                }
+            }
+            return remainingSessions;
+        });
+    }, [activeChatId]);
+    
+    // Effect to create a new chat if all chats are deleted
+    useEffect(() => {
+        if (!isInitializing && chatSessions.length === 0) {
+            handleNewChat();
+        }
+    }, [chatSessions, isInitializing, handleNewChat]);
+
+    const handleClearHistory = useCallback(() => {
+        setChatSessions([]); // This will trigger the useEffect above to create a new chat
+        setActiveChatId(null);
+        setIsHistoryPanelOpen(false);
+    }, []);
+
+
     return (
         <div className="flex flex-col h-screen bg-slate-900 text-slate-100 p-4 md:p-6 overflow-hidden">
+            <ChatHistoryPanel 
+                isOpen={isHistoryPanelOpen}
+                onClose={() => setIsHistoryPanelOpen(false)}
+                sessions={chatSessions}
+                activeSessionId={activeChatId}
+                onSelectSession={handleSelectChat}
+                onNewSession={handleNewChat}
+                onDeleteSession={handleDeleteChat}
+                onClearAllSessions={handleClearHistory}
+            />
             <header className="flex-shrink-0 flex items-center justify-center text-center py-4 relative">
                 <div className="absolute top-2 left-2 flex items-center gap-2">
+                     <button
+                        onClick={() => setIsHistoryPanelOpen(true)}
+                        className="p-2 rounded-full text-slate-400 hover:text-cyan-400 hover:bg-slate-700/50 transition-colors focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                        aria-label="View chat history"
+                        title="View chat history"
+                    >
+                        <HistoryIcon />
+                    </button>
                      <button
                         onClick={() => setIsConnectionsModalOpen(true)}
                         className="p-2 rounded-full text-slate-400 hover:text-cyan-400 hover:bg-slate-700/50 transition-colors focus:outline-none focus:ring-2 focus:ring-cyan-500 disabled:opacity-50 disabled:cursor-wait"
@@ -268,7 +399,13 @@ const App: React.FC = () => {
             </header>
             
             <main className="flex-1 flex flex-col min-h-0">
-                <ChatInterface messages={messages} isLoading={isLoading} onSendMessage={handleSendMessage} onConsent={handleConsent} />
+                <ChatInterface
+                    key={activeChatId} // Force re-mount on chat switch to clear state
+                    messages={activeChat?.messages || []}
+                    isLoading={isLoading}
+                    onSendMessage={handleSendMessage}
+                    onConsent={handleConsent}
+                />
             </main>
             
             <ConnectionsModal 

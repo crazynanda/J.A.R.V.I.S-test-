@@ -5,6 +5,7 @@ import { type MessageAuthor } from '../types';
 interface MessageProps {
     author: MessageAuthor;
     text: string;
+    image?: string;
     isLoading?: boolean;
 }
 
@@ -23,7 +24,7 @@ const AiIcon: React.FC = () => (
 );
 
 
-export const Message: React.FC<MessageProps> = ({ author, text, isLoading = false }) => {
+export const Message: React.FC<MessageProps> = ({ author, text, image, isLoading = false }) => {
     const isUser = author === 'user';
     
     const containerClasses = `flex items-start gap-3 max-w-xl animate-fade-in ${isUser ? 'ml-auto flex-row-reverse' : 'mr-auto'}`;
@@ -40,7 +41,16 @@ export const Message: React.FC<MessageProps> = ({ author, text, isLoading = fals
                         <span className="w-2 h-2 bg-slate-400 rounded-full animate-pulse"></span>
                     </div>
                 ) : (
-                    <p className="text-slate-200 whitespace-pre-wrap">{text}</p>
+                    <div className="space-y-2">
+                        {image && (
+                            <img 
+                                src={image} 
+                                alt="User capture" 
+                                className="rounded-lg max-w-xs md:max-w-sm"
+                            />
+                        )}
+                        {text && <p className="text-slate-200 whitespace-pre-wrap">{text}</p>}
+                    </div>
                 )}
             </div>
         </div>

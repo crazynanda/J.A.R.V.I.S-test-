@@ -1,3 +1,4 @@
+
 import React, { useRef, useEffect } from 'react';
 import { type ChatMessage } from '../types';
 import { Message } from './Message';
@@ -6,7 +7,7 @@ import { InputBar } from './InputBar';
 interface ChatInterfaceProps {
     messages: ChatMessage[];
     isLoading: boolean;
-    onSendMessage: (text: string) => void;
+    onSendMessage: (text: string, image?: string) => void;
     onConsent: (message: ChatMessage) => void;
 }
 
@@ -19,14 +20,14 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ messages, isLoadin
 
     useEffect(() => {
         scrollToBottom();
-    }, [messages]);
+    }, [messages, isLoading]);
 
     return (
         <div className="flex flex-col flex-1 bg-slate-800/50 rounded-xl overflow-hidden border border-slate-700/50">
             <div className="flex-1 p-4 md:p-6 overflow-y-auto space-y-2">
                 {messages.map((msg, index) => (
                     <div key={index}>
-                        <Message author={msg.author} text={msg.text} />
+                        <Message author={msg.author} text={msg.text} image={msg.image}/>
                         {msg.author === 'ai' && msg.requiresConsent && !msg.consentGranted && (
                             <div className="flex justify-start pl-11 pt-2 animate-fade-in">
                                 <button 
@@ -45,7 +46,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ messages, isLoadin
                 )}
                 <div ref={messagesEndRef} />
             </div>
-            <div className="p-4 bg-slate-800/70 border-t border-slate-700/50">
+            <div className="p-4 bg-slate-800/70 border-t border-slate-700/50 flex-shrink-0">
                 <InputBar onSendMessage={onSendMessage} isLoading={isLoading} />
             </div>
         </div>
