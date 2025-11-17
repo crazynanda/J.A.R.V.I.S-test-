@@ -290,4 +290,3 @@ export const LiveConversationModal: React.FC<{ isOpen: boolean; onClose: () => v
         </div>
     );
 };
-

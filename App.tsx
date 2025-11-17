@@ -518,8 +518,8 @@ const App: React.FC = () => {
                 </div>
                 <div className="flex flex-col items-center">
                     <Orb isLoading={isLoading} />
-                    <h1 className="text-2xl md:text-3xl font-bold mt-4 text-slate-200 tracking-tight">J.A.R.V.I.S</h1>
-                    <p className="text-sm md:text-base text-slate-400">Your personal Jarvis for life.</p>
+                    <h1 className="text-2xl md:text-3xl font-bold mt-4 text-slate-200 tracking-tight">Nanda's assistant</h1>
+                    <p className="text-sm md:text-base text-slate-400">Your personal assistant for life.</p>
                 </div>
             </header>
             

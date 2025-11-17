@@ -1,3 +1,4 @@
+
 import React from 'react';
 import { type ServiceIntegration, ServiceAccount } from '../types';
 
@@ -63,7 +64,7 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({ isOpen, onCl
 
                 <div className="p-6 space-y-4 max-h-[70vh] overflow-y-auto">
                     <p className="text-sm text-slate-400">
-                        Connect your personal accounts to give J.A.R.V.I.S context and enable proactive assistance. Your data is processed securely.
+                        Connect your personal accounts to give Nanda's assistant context and enable proactive assistance. Your data is processed securely.
                     </p>
                     <ul className="space-y-1">
                         {integrations.map(integration => (
