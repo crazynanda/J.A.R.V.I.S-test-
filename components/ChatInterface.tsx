@@ -7,11 +7,13 @@ import { InputBar } from './InputBar';
 interface ChatInterfaceProps {
     messages: ChatMessage[];
     isLoading: boolean;
-    onSendMessage: (text: string, image?: string) => void;
+    onSendMessage: (text: string, media?: {type: 'image' | 'video' | 'audio', data: string}, options?: {aspectRatio?: string}) => void;
     onConsent: (message: ChatMessage) => void;
+    isVeoKeyNeeded: boolean;
+    onSelectVeoKey: () => void;
 }
 
-export const ChatInterface: React.FC<ChatInterfaceProps> = ({ messages, isLoading, onSendMessage, onConsent }) => {
+export const ChatInterface: React.FC<ChatInterfaceProps> = ({ messages, isLoading, onSendMessage, onConsent, isVeoKeyNeeded, onSelectVeoKey }) => {
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const scrollToBottom = () => {
@@ -25,9 +27,30 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ messages, isLoadin
     return (
         <div className="flex flex-col flex-1 bg-slate-800/50 rounded-xl overflow-hidden border border-slate-700/50">
             <div className="flex-1 p-4 md:p-6 overflow-y-auto space-y-2">
+                {isVeoKeyNeeded && (
+                     <div className="bg-blue-900/50 border border-blue-700 text-blue-200 px-4 py-3 rounded-lg relative text-sm flex items-center justify-between gap-4" role="alert">
+                        <div>
+                            <strong className="font-bold">Project required for video generation. </strong>
+                            <span className="block sm:inline">Please select a project to enable Veo video features.</span>
+                            <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noopener noreferrer" className="underline ml-1 hover:text-white">Learn about billing.</a>
+                        </div>
+                        <button onClick={onSelectVeoKey} className="bg-blue-500 text-white font-semibold rounded-lg px-4 py-2 hover:bg-blue-600 transition-colors flex-shrink-0">
+                            Select Project
+                        </button>
+                    </div>
+                )}
                 {messages.map((msg, index) => (
                     <div key={index}>
-                        <Message author={msg.author} text={msg.text} image={msg.image}/>
+                        <Message 
+                            author={msg.author} 
+                            text={msg.text} 
+                            image={msg.image} 
+                            video={msg.video}
+                            audio={msg.audio}
+                            generatedImage={msg.generatedImage} 
+                            generatedVideo={msg.generatedVideo}
+                            groundingSources={msg.groundingSources}
+                        />
                         {msg.author === 'ai' && msg.requiresConsent && !msg.consentGranted && (
                             <div className="flex justify-start pl-11 pt-2 animate-fade-in">
                                 <button 

@@ -3,13 +3,14 @@ import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react'
 import { Orb } from './components/Orb';
 import { ChatInterface } from './components/ChatInterface';
 import { ChatHistoryPanel } from './components/ChatHistoryPanel';
-import { type ChatMessage, type ServiceIntegration, type ChatSession } from './types';
+import { type ChatMessage, type ServiceIntegration, type ChatSession, type User } from './types';
 import { getAiResponse, getAiSpeech, getAiResponseAfterConsent } from './services/geminiService';
-import { getDeviceEmailAccounts } from './services/mockDataService';
+import { getDeviceEmailAccounts, signInWithGoogle, signOut } from './services/mockDataService';
 import { VoiceToggle } from './components/VoiceToggle';
 import { ConnectionsModal } from './components/ConnectionsModal';
-import { ConnectionsIcon, HistoryIcon } from './components/icons';
-import { INITIAL_INTEGRATIONS, INITIAL_MESSAGE } from './constants';
+import { ConnectionsIcon, HistoryIcon, GoogleIcon, ConversationModeIcon } from './components/icons';
+import { INITIAL_INTEGRATIONS } from './constants';
+import { LiveConversationModal } from './components/LiveConversationModal';
 
 // --- Local Storage Keys ---
 const CHAT_SESSIONS_KEY = 'jarvis-chat-sessions';
@@ -97,9 +98,14 @@ const App: React.FC = () => {
     const [isHistoryPanelOpen, setIsHistoryPanelOpen] = useState(false);
     const [integrations, setIntegrations] = useState<ServiceIntegration[]>(INITIAL_INTEGRATIONS);
     const [isInitializing, setIsInitializing] = useState(true);
+    const [user, setUser] = useState<User | null>(null);
+    const [isProfileOpen, setIsProfileOpen] = useState(false);
+    const [isVeoKeyNeeded, setIsVeoKeyNeeded] = useState(false);
+    const [isLiveModeOpen, setIsLiveModeOpen] = useState(false);
 
     const audioContextRef = useRef<AudioContext | null>(null);
     const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+    const profileRef = useRef<HTMLDivElement>(null);
 
     // Load sessions from localStorage on initial render
     useEffect(() => {
@@ -117,7 +123,8 @@ const App: React.FC = () => {
             } else {
                 handleNewChat(); // Create a new chat if no storage found
             }
-        } catch (error) {
+        } catch (error)
+        {
             console.error('Failed to load chat history:', error);
             handleNewChat(); // Start fresh if loading fails
         }
@@ -180,6 +187,13 @@ const App: React.FC = () => {
         };
         window.addEventListener('click', resumeAudio, true);
 
+        const handleClickOutside = (event: MouseEvent) => {
+            if (profileRef.current && !profileRef.current.contains(event.target as Node)) {
+                setIsProfileOpen(false);
+            }
+        };
+        document.addEventListener('mousedown', handleClickOutside);
+
         const initializeApp = async () => {
             setIsInitializing(true);
             try {
@@ -195,6 +209,10 @@ const App: React.FC = () => {
                         return int;
                     })
                 );
+                // @ts-ignore
+                if (window.aistudio && await window.aistudio.hasSelectedApiKey() === false) {
+                    setIsVeoKeyNeeded(true);
+                }
             } catch (error) {
                 console.error("Failed to discover device accounts:", error);
             } finally {
@@ -206,6 +224,7 @@ const App: React.FC = () => {
 
         return () => {
             window.removeEventListener('click', resumeAudio, true);
+            document.removeEventListener('mousedown', handleClickOutside);
             stopAudioInternal();
         };
     }, [stopAudioInternal]);
@@ -222,36 +241,42 @@ const App: React.FC = () => {
         }
     }, [isVoiceOutputEnabled]);
     
-    const updateActiveChat = (updater: (prevMessages: ChatMessage[]) => ChatMessage[]) => {
+    const updateActiveChat = (updater: (prevMessages: ChatMessage[]) => ChatMessage[], chatId: string | null = activeChatId) => {
         setChatSessions(prevSessions =>
             prevSessions.map(session =>
-                session.id === activeChatId
+                session.id === chatId
                     ? { ...session, messages: updater(session.messages), lastUpdated: Date.now() }
                     : session
             )
         );
     };
 
-    const handleSendMessage = useCallback(async (text: string, image?: string) => {
-        if (!text.trim() && !image) return;
+    const handleSendMessage = useCallback(async (text: string, media?: { type: 'image' | 'video' | 'audio', data: string }, options?: {aspectRatio?: string}) => {
+        if (!text.trim() && !media) return;
         if (!activeChat) return;
 
         stopAudioInternal();
-        const userMessage: ChatMessage = { author: 'user', text, image };
+        const userMessage: ChatMessage = { author: 'user', text };
+        if (media) {
+            userMessage[media.type] = media.data;
+        }
         updateActiveChat(prev => [...prev, userMessage]);
         setIsLoading(true);
 
         try {
-            const aiResponse = await getAiResponse(text, image, activeChat.messages, integrations);
+            const aiResponse = await getAiResponse(text, media, options, activeChat.messages, integrations);
             const aiMessage: ChatMessage = { 
                 author: 'ai', 
                 text: aiResponse.text,
+                generatedImage: aiResponse.generatedImage,
+                generatedVideo: aiResponse.generatedVideo,
+                groundingSources: aiResponse.groundingSources,
                 requiresConsent: aiResponse.requiresConsent,
                 action: aiResponse.action,
             };
             updateActiveChat(prev => [...prev, aiMessage]);
             
-            if (!aiResponse.requiresConsent) {
+            if (!aiResponse.requiresConsent && !aiResponse.generatedImage && !aiResponse.generatedVideo) {
                 await playAiSpeech(aiResponse.text);
             }
         } catch (error) {
@@ -311,11 +336,60 @@ const App: React.FC = () => {
         }));
     }, []);
 
+    const handleSignIn = useCallback(async () => {
+        try {
+            const loggedInUser = await signInWithGoogle();
+            setUser(loggedInUser);
+
+            setIntegrations(prev => prev.map(int => {
+                if (int.id === 'email' && int.accounts) {
+                    const newAccounts = int.accounts.map(acc => 
+                        acc.id === loggedInUser.email ? { ...acc, connected: true } : acc
+                    );
+                    const isAnyAccountConnected = newAccounts.some(acc => acc.connected);
+                    return { ...int, accounts: newAccounts, connected: isAnyAccountConnected };
+                }
+                if (int.id === 'calendar') {
+                    return { ...int, connected: true };
+                }
+                return int;
+            }));
+            setIsProfileOpen(false);
+        } catch (error) {
+            console.error("Sign in failed:", error);
+        }
+    }, []);
+
+    const handleSignOut = useCallback(async () => {
+        try {
+            await signOut();
+            const loggedOutEmail = user?.email;
+            setUser(null);
+
+            setIntegrations(prev => prev.map(int => {
+                if (int.id === 'email' && int.accounts && loggedOutEmail) {
+                     const newAccounts = int.accounts.map(acc => 
+                        acc.id === loggedOutEmail ? { ...acc, connected: false } : acc
+                    );
+                    const isAnyAccountConnected = newAccounts.some(acc => acc.connected);
+                    return { ...int, accounts: newAccounts, connected: isAnyAccountConnected };
+                }
+                if (int.id === 'calendar') {
+                    return { ...int, connected: false };
+                }
+                return int;
+            }));
+            setIsProfileOpen(false);
+        } catch (error) {
+            console.error("Sign out failed:", error);
+        }
+    }, [user]);
+
     const handleNewChat = useCallback(() => {
         const newChat: ChatSession = {
             id: Date.now().toString(),
             lastUpdated: Date.now(),
-            messages: [INITIAL_MESSAGE],
+            messages: [],
         };
         setChatSessions(prev => [newChat, ...prev]);
         setActiveChatId(newChat.id);
@@ -330,19 +404,15 @@ const App: React.FC = () => {
     const handleDeleteChat = useCallback((idToDelete: string) => {
         setChatSessions(prev => {
             const remainingSessions = prev.filter(s => s.id !== idToDelete);
-            // If the deleted chat was the active one, switch to the newest chat or create one
             if (activeChatId === idToDelete) {
                 if (remainingSessions.length > 0) {
                     setActiveChatId(remainingSessions.sort((a, b) => b.lastUpdated - a.lastUpdated)[0].id);
-                } else {
-                    // This path will be handled by the logic below
                 }
             }
             return remainingSessions;
         });
     }, [activeChatId]);
     
-    // Effect to create a new chat if all chats are deleted
     useEffect(() => {
         if (!isInitializing && chatSessions.length === 0) {
             handleNewChat();
@@ -350,11 +420,22 @@ const App: React.FC = () => {
     }, [chatSessions, isInitializing, handleNewChat]);
 
     const handleClearHistory = useCallback(() => {
-        setChatSessions([]); // This will trigger the useEffect above to create a new chat
+        setChatSessions([]); 
         setActiveChatId(null);
         setIsHistoryPanelOpen(false);
     }, []);
-
+    
+    const handleSelectVeoKey = async () => {
+        // @ts-ignore
+        if (window.aistudio) {
+            // @ts-ignore
+            await window.aistudio.openSelectKey();
+            setIsVeoKeyNeeded(false);
+            // We can optionally add a message to the chat to inform the user to try again
+             const infoMessage: ChatMessage = { author: 'ai', text: "Your project has been configured. Please try your video generation request again." };
+            updateActiveChat(prev => [...prev, infoMessage]);
+        }
+    };
 
     return (
         <div className="flex flex-col h-screen bg-slate-900 text-slate-100 p-4 md:p-6 overflow-hidden">
@@ -388,7 +469,51 @@ const App: React.FC = () => {
                         <ConnectionsIcon />
                     </button>
                 </div>
-                <div className="absolute top-2 right-2">
+                <div className="absolute top-2 right-2 flex items-center gap-4">
+                    {user ? (
+                        <div className="relative" ref={profileRef}>
+                            <button
+                                onClick={() => setIsProfileOpen(p => !p)}
+                                className="w-9 h-9 rounded-full focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-cyan-500"
+                                aria-label="Open user menu"
+                                aria-expanded={isProfileOpen}
+                            >
+                                <img src={user.avatar} alt="User avatar" className="rounded-full" />
+                            </button>
+                            {isProfileOpen && (
+                                <div className="absolute right-0 mt-2 w-48 bg-slate-800 border border-slate-700 rounded-lg shadow-lg py-1 z-10 animate-fade-in">
+                                    <div className="px-3 py-2 border-b border-slate-700">
+                                        <p className="text-sm font-semibold text-slate-200 truncate">{user.name}</p>
+                                        <p className="text-xs text-slate-400 truncate">{user.email}</p>
+                                    </div>
+                                    <button
+                                        onClick={handleSignOut}
+                                        className="w-full text-left px-3 py-2 text-sm text-slate-300 hover:bg-slate-700 transition-colors"
+                                    >
+                                        Sign Out
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    ) : (
+                         <button
+                            onClick={handleSignIn}
+                            className="flex items-center gap-2 bg-white text-slate-800 font-semibold px-3 py-1.5 rounded-lg text-sm hover:bg-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-white disabled:opacity-50 disabled:cursor-wait"
+                            aria-label="Sign in with Google"
+                            disabled={isInitializing}
+                        >
+                            <GoogleIcon />
+                            <span>Sign In</span>
+                        </button>
+                    )}
+                    <button
+                        onClick={() => setIsLiveModeOpen(true)}
+                        className="p-2 rounded-full text-slate-400 hover:text-cyan-400 hover:bg-slate-700/50 transition-colors focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                        aria-label="Start Live Conversation"
+                        title="Start Live Conversation"
+                    >
+                        <ConversationModeIcon />
+                    </button>
                     <VoiceToggle isEnabled={isVoiceOutputEnabled} onToggle={handleToggleVoice} disabled={!audioContextRef.current} />
                 </div>
                 <div className="flex flex-col items-center">
@@ -405,6 +530,8 @@ const App: React.FC = () => {
                     isLoading={isLoading}
                     onSendMessage={handleSendMessage}
                     onConsent={handleConsent}
+                    isVeoKeyNeeded={isVeoKeyNeeded}
+                    onSelectVeoKey={handleSelectVeoKey}
                 />
             </main>
             
@@ -413,6 +540,10 @@ const App: React.FC = () => {
                 onClose={() => setIsConnectionsModalOpen(false)}
                 integrations={integrations}
                 onToggle={handleToggleIntegration}
+            />
+            <LiveConversationModal
+                isOpen={isLiveModeOpen}
+                onClose={() => setIsLiveModeOpen(false)}
             />
         </div>
     );

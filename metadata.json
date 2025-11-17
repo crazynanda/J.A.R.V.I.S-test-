@@ -3,6 +3,7 @@
   "description": "J.A.R.V.I.S is a personal Jarvis-like AI that organizes your mind, work, and wellbeing, with privacy built in. It simulates understanding your life by integrating with calendars, email, and wellbeing data to provide contextual assistance through a conversational UI.",
   "requestFramePermissions": [
     "microphone",
-    "camera"
+    "camera",
+    "geolocation"
   ]
 }

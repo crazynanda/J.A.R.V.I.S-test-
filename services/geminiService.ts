@@ -1,13 +1,21 @@
 
 import { GoogleGenAI, Modality, type Content, GenerateContentResponse, Tool, Part, Type } from "@google/genai";
-import { type ChatMessage, type AiResponse, type ServiceIntegration } from '../types';
+import { type ChatMessage, type AiResponse, type ServiceIntegration, GroundingSource, GeneratedVideo } from '../types';
 import { AI_PERSONA_INSTRUCTIONS, generateLifeStateGraph } from '../constants';
 import { 
     getEmails, getEmailsFunctionDeclaration,
     requestPermissionFunctionDeclaration,
     getCalendarEvents, getCalendarEventsFunctionDeclaration,
+    createCalendarEvent, createCalendarEventFunctionDeclaration,
     getWellbeingData, getWellbeingDataFunctionDeclaration,
-    getSmartHomeStatus, getSmartHomeStatusFunctionDeclaration
+    getSmartHomeStatus, getSmartHomeStatusFunctionDeclaration,
+    generateImageFunctionDeclaration,
+    editImageFunctionDeclaration,
+    generateVideoFunctionDeclaration,
+    useGoogleSearchFunctionDeclaration,
+    useGoogleMapsFunctionDeclaration,
+    requestLocationFunctionDeclaration,
+    getUserLocation,
 } from './mockDataService';
 
 if (!process.env.API_KEY) {
@@ -15,35 +23,44 @@ if (!process.env.API_KEY) {
 }
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-const model = 'gemini-2.5-flash';
 
 // A map of available tools the AI can call.
 const availableTools: { [key: string]: Function } = {
     getEmails,
     getCalendarEvents,
+    createCalendarEvent,
     getWellbeingData,
     getSmartHomeStatus,
+    getUserLocation,
+    // These are placeholders for the AI to signal intent for grounding
+    useGoogleSearch: async () => ({ result: "Now searching Google..."}),
+    useGoogleMaps: async () => ({ result: "Now searching Google Maps..."}),
 };
 
-const tools: Tool[] = [{
-    functionDeclarations: [
-        requestPermissionFunctionDeclaration,
-        getEmailsFunctionDeclaration,
-        getCalendarEventsFunctionDeclaration,
-        getWellbeingDataFunctionDeclaration,
-        getSmartHomeStatusFunctionDeclaration
-    ]
-}];
+const functionDeclarations = [
+    requestPermissionFunctionDeclaration,
+    getEmailsFunctionDeclaration,
+    getCalendarEventsFunctionDeclaration,
+    createCalendarEventFunctionDeclaration,
+    getWellbeingDataFunctionDeclaration,
+    getSmartHomeStatusFunctionDeclaration,
+    generateImageFunctionDeclaration,
+    editImageFunctionDeclaration,
+    generateVideoFunctionDeclaration,
+    useGoogleSearchFunctionDeclaration,
+    useGoogleMapsFunctionDeclaration,
+    requestLocationFunctionDeclaration,
+];
 
 /**
  * Creates a Part object for an image from a data URL.
- * @param imageDataUrl The base64 encoded image data URL.
+ * @param dataUrl The base64 encoded data URL.
  * @returns A Part object for the Gemini API or null if the format is invalid.
  */
-function getImagePart(imageDataUrl: string): Part | null {
-    const match = imageDataUrl.match(/^data:(image\/.+);base64,(.+)$/);
+function getMediaPart(dataUrl: string): Part | null {
+    const match = dataUrl.match(/^data:(.+);base64,(.+)$/);
     if (!match) {
-        console.error("Invalid image data URL format");
+        console.error("Invalid data URL format");
         return null;
     }
     const mimeType = match[1];
@@ -68,14 +85,24 @@ function formatHistoryForApi(history: ChatMessage[]): Content[] {
     }
 
     for (const message of processingHistory) {
+        const parts: Part[] = [];
+        if (message.text) {
+            parts.push({ text: message.text });
+        }
+        if (message.image) {
+            const imagePart = getMediaPart(message.image);
+            if (imagePart) parts.push(imagePart);
+        }
+         if (message.video) {
+            const videoPart = getMediaPart(message.video);
+            if (videoPart) parts.push(videoPart);
+        }
+        if (message.audio) {
+            const audioPart = getMediaPart(message.audio);
+            if (audioPart) parts.push(audioPart);
+        }
+
         if (message.author === 'user') {
-            const parts: Part[] = [{ text: message.text }];
-            if (message.image) {
-                const imagePart = getImagePart(message.image);
-                if (imagePart) {
-                    parts.push(imagePart);
-                }
-            }
             apiHistory.push({ role: 'user', parts });
         } else { // author === 'ai'
             if (message.requiresConsent && message.action) {
@@ -92,10 +119,10 @@ function formatHistoryForApi(history: ChatMessage[]): Content[] {
                         }
                     }]
                 });
-            } else if (message.text) { 
+            } else if (parts.length > 0) { 
                 apiHistory.push({
                     role: 'model',
-                    parts: [{ text: message.text }]
+                    parts
                 });
             }
         }
@@ -106,17 +133,6 @@ function formatHistoryForApi(history: ChatMessage[]): Content[] {
 async function executeTool(toolName: string, toolArgs: any, connections: ServiceIntegration[]): Promise<Part> {
      if (toolName in availableTools) {
         try {
-            if (toolName === 'getEmails') {
-                const emailIntegration = connections.find(c => c.id === 'email');
-                const connectedAccounts = emailIntegration?.accounts?.filter(a => a.connected).map(a => a.id) || [];
-                
-                if (!toolArgs.accountIds || toolArgs.accountIds.length === 0) {
-                    toolArgs.accountIds = connectedAccounts;
-                } else {
-                    toolArgs.accountIds = toolArgs.accountIds.filter((id: string) => connectedAccounts.includes(id));
-                }
-            }
-
             const toolResponse = await availableTools[toolName](toolArgs);
             return {
                 functionResponse: {
@@ -133,6 +149,24 @@ async function executeTool(toolName: string, toolArgs: any, connections: Service
                 },
             };
         }
+    } else if (toolName === 'requestLocation') {
+        // Special handling for client-side permission request
+        try {
+            const location = await getUserLocation();
+            return {
+                functionResponse: {
+                    name: toolName,
+                    response: { result: JSON.stringify(location) }
+                }
+            };
+        } catch (error) {
+            return {
+                functionResponse: {
+                    name: toolName,
+                    response: { error: (error as Error).message }
+                }
+            };
+        }
     } else {
         console.warn(`Function ${toolName} not found.`);
         return {
@@ -144,45 +178,66 @@ async function executeTool(toolName: string, toolArgs: any, connections: Service
     }
 }
 
+
+function selectModel(prompt: string, media?: { type: 'image' | 'video' | 'audio', data: string }): string {
+    if (media?.type === 'video' || media?.type === 'audio') {
+        return 'gemini-2.5-pro';
+    }
+    const complexKeywords = ['analyze', 'code', 'plan', 'complex', 'explain in detail'];
+    if (complexKeywords.some(kw => prompt.toLowerCase().includes(kw))) {
+        return 'gemini-2.5-pro';
+    }
+    if (prompt.split(' ').length <= 3) {
+        return 'gemini-2.5-flash-lite';
+    }
+    return 'gemini-2.5-flash';
+}
+
 /**
- * Gets a text response from the Gemini model, handling the consent flow and tool calls.
- * @param prompt The user's latest message.
- * @param image Optional base64 encoded image string.
- * @param history The current chat history.
- * @param connections The current state of service integrations.
- * @returns A structured AiResponse object.
+ * Gets a text response from the Gemini model, handling tool calls, model selection, and various generation tasks.
  */
 export async function getAiResponse(
     prompt: string, 
-    image: string | undefined,
+    media: { type: 'image' | 'video' | 'audio', data: string } | undefined,
+    options: { aspectRatio?: string } | undefined,
     history: ChatMessage[],
     connections: ServiceIntegration[]
 ): Promise<AiResponse> {
+    const modelName = selectModel(prompt, media);
+    console.log(`Using model: ${modelName}`);
+
+    const config: any = {
+        tools: [{ functionDeclarations }],
+        systemInstruction: `${AI_PERSONA_INSTRUCTIONS}\n\n${generateLifeStateGraph(connections)}`
+    };
+
+    if (modelName === 'gemini-2.5-pro') {
+        config.thinkingConfig = { thinkingBudget: 32768 };
+    }
+
     const chat = ai.chats.create({
-        model: model,
-        config: {
-            tools: tools,
-            systemInstruction: `${AI_PERSONA_INSTRUCTIONS}\n\n${generateLifeStateGraph(connections)}`
-        },
+        model: modelName,
+        config: config,
         history: formatHistoryForApi(history)
     });
 
     const userParts: Part[] = [{ text: prompt }];
-    if (image) {
-        const imagePart = getImagePart(image);
-        if (imagePart) {
-            userParts.push(imagePart);
+    if (media) {
+        const mediaPart = getMediaPart(media.data);
+        if (mediaPart) {
+            userParts.push(mediaPart);
         }
     }
 
-    // Fix: chat.sendMessage expects an object with a `message` property.
-    const result = await chat.sendMessage({ message: userParts });
-    const response = result;
-    const functionCall = response.functionCalls?.[0];
+    let result = await chat.sendMessage({ message: userParts });
+    let response = result;
 
-    if (functionCall) {
+    while (response.functionCalls && response.functionCalls.length > 0) {
+        const functionCall = response.functionCalls[0];
+        console.log("AI wants to call a tool:", functionCall);
+
+        // --- SPECIAL TOOL HANDLING ---
         if (functionCall.name === 'requestPermission') {
-            console.log("AI is requesting permission:", functionCall.args);
             return {
                 text: functionCall.args.reason as string,
                 requiresConsent: true,
@@ -191,25 +246,149 @@ export async function getAiResponse(
                     toolArgs: functionCall.args.toolArgs || {}
                 }
             };
-        } else {
-            console.log("AI wants to call a tool directly:", functionCall);
-            const functionResponsePart = await executeTool(functionCall.name, functionCall.args, connections);
-            // Fix: chat.sendMessage expects an object with a `message` property.
-            const secondResult = await chat.sendMessage({ message: [functionResponsePart] });
-            return { text: secondResult.text };
         }
-    } else {
-        return { text: response.text };
+        
+        if (functionCall.name === 'generateImage') {
+            const imagePrompt = functionCall.args.prompt as string;
+            const aspectRatio = functionCall.args.aspectRatio as "1:1" | "16:9" | "9:16" | "4:3" | "3:4";
+             try {
+                const imageResult = await ai.models.generateImages({
+                    model: 'imagen-4.0-generate-001',
+                    prompt: imagePrompt,
+                    config: {
+                        numberOfImages: 1,
+                        aspectRatio: aspectRatio || '1:1'
+                    },
+                });
+
+                const base64ImageBytes = imageResult.generatedImages[0].image.imageBytes;
+                const imageUrl = `data:image/png;base64,${base64ImageBytes}`;
+                 const functionResponsePart: Part = { functionResponse: { name: 'generateImage', response: { result: `Successfully generated image.` } } };
+                result = await chat.sendMessage({ message: [functionResponsePart] });
+                return { text: result.text, generatedImage: imageUrl };
+             } catch (error) {
+                 console.error("Error generating image:", error);
+                 const functionResponsePart: Part = { functionResponse: { name: 'generateImage', response: { error: (error as Error).message } } };
+                 result = await chat.sendMessage({ message: [functionResponsePart] });
+                 return { text: result.text };
+             }
+        }
+        
+        if (functionCall.name === 'editImage') {
+             const imagePrompt = functionCall.args.prompt as string;
+             // Find the last user message with an image to edit
+             const lastUserImageMsg = [...history].reverse().find(m => m.author === 'user' && m.image);
+             if (!lastUserImageMsg || !lastUserImageMsg.image) {
+                 return { text: "I'm sorry, I couldn't find an image to edit. Please upload one first." };
+             }
+             try {
+                const imagePart = getMediaPart(lastUserImageMsg.image);
+                if (!imagePart) throw new Error("Invalid image format for editing.");
+                
+                const imageResult = await ai.models.generateContent({
+                    model: 'gemini-2.5-flash-image',
+                    contents: { parts: [imagePart, { text: imagePrompt }] },
+                    config: { responseModalities: [Modality.IMAGE] },
+                });
+                const resultPart = imageResult.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
+                if (resultPart?.inlineData) {
+                    const imageUrl = `data:${resultPart.inlineData.mimeType};base64,${resultPart.inlineData.data}`;
+                    const functionResponsePart: Part = { functionResponse: { name: 'editImage', response: { result: "Successfully edited the image." } } };
+                    result = await chat.sendMessage({ message: [functionResponsePart] });
+                    return { text: result.text, generatedImage: imageUrl };
+                } else {
+                    throw new Error("No edited image data received.");
+                }
+             } catch(error) {
+                console.error("Error editing image:", error);
+                const functionResponsePart: Part = { functionResponse: { name: 'editImage', response: { error: (error as Error).message } } };
+                result = await chat.sendMessage({ message: [functionResponsePart] });
+                return { text: result.text };
+             }
+        }
+        
+        if (functionCall.name === 'generateVideo') {
+             const videoPrompt = functionCall.args.prompt as string;
+             const aspectRatio = functionCall.args.aspectRatio as '16:9' | '9:16';
+             const imageToAnimate = functionCall.args.image as string | undefined; // Assuming AI might pass this if it decides to animate
+
+             const lastUserImageMsg = [...history, {author: 'user', text: prompt, image: media?.type === 'image' ? media.data : undefined}].reverse().find(m => m.author === 'user' && m.image);
+             const imagePayload = imageToAnimate || lastUserImageMsg?.image ? { image: getMediaPart(imageToAnimate || lastUserImageMsg!.image!) } : {};
+             
+             try {
+                 // @ts-ignore
+                 if (window.aistudio && await window.aistudio.hasSelectedApiKey() === false) {
+                    return { text: "To generate a video, you first need to select a project. Please click the 'Select Project' button to continue." };
+                 }
+
+                const localAi = new GoogleGenAI({ apiKey: process.env.API_KEY });
+                const request = {
+                    model: 'veo-3.1-fast-generate-preview',
+                    prompt: videoPrompt,
+                    ...imagePayload,
+                    config: {
+                        numberOfVideos: 1,
+                        aspectRatio: aspectRatio || '16:9',
+                    },
+                };
+                
+                // @ts-ignore
+                const operation = await localAi.models.generateVideos(request);
+                const functionResponsePart: Part = { functionResponse: { name: 'generateVideo', response: { result: `Starting video generation. This may take a few minutes.` } } };
+                result = await chat.sendMessage({ message: [functionResponsePart] });
+                return {
+                    text: result.text,
+                    generatedVideo: { state: 'generating', operationName: operation.name }
+                };
+
+             } catch (error) {
+                 console.error("Error starting video generation:", error);
+                 const functionResponsePart: Part = { functionResponse: { name: 'generateVideo', response: { error: (error as Error).message } } };
+                 result = await chat.sendMessage({ message: [functionResponsePart] });
+                 return { text: result.text };
+             }
+        }
+        
+        // --- GROUNDING HANDLING ---
+        if (functionCall.name === 'useGoogleSearch' || functionCall.name === 'useGoogleMaps') {
+             const isMaps = functionCall.name === 'useGoogleMaps';
+             const groundingConfig: any = {
+                 tools: isMaps ? [{ googleMaps: {} }, {googleSearch: {}}] : [{ googleSearch: {} }],
+             };
+             if (isMaps) {
+                 try {
+                     const location = await getUserLocation();
+                     groundingConfig.toolConfig = { retrievalConfig: { latLng: location } };
+                 } catch (e) { /* fail silently, proceed without location */ }
+             }
+
+             const groundingResult = await ai.models.generateContent({
+                 model: 'gemini-2.5-flash',
+                 contents: userParts,
+                 config: groundingConfig
+             });
+             
+             const groundingChunks = groundingResult.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+             const sources: GroundingSource[] = groundingChunks.map((chunk: any) => ({
+                 uri: chunk.web?.uri || chunk.maps?.uri || '',
+                 title: chunk.web?.title || chunk.maps?.title || 'Source'
+             })).filter((s: GroundingSource) => s.uri);
+             
+             return { text: groundingResult.text, groundingSources: sources };
+        }
+
+        // --- REGULAR TOOL HANDLING ---
+        const functionResponsePart = await executeTool(functionCall.name, functionCall.args, connections);
+        result = await chat.sendMessage({ message: [functionResponsePart] });
+        response = result;
     }
+
+    return { text: response.text };
 }
 
 
 /**
  * Continues the conversation after user has granted consent to execute a tool.
- * @param action The tool action to execute.
- * @param history The chat history leading up to the consent request.
- * @param connections The current state of service integrations.
- * @returns A structured AiResponse object with the final text.
  */
 export async function getAiResponseAfterConsent(
     action: { toolName: string; toolArgs: any; },
@@ -217,9 +396,9 @@ export async function getAiResponseAfterConsent(
     connections: ServiceIntegration[]
 ): Promise<AiResponse> {
     const chat = ai.chats.create({
-        model: model,
+        model: 'gemini-2.5-flash',
         config: {
-            tools: tools,
+            tools: [{ functionDeclarations }],
             systemInstruction: `${AI_PERSONA_INSTRUCTIONS}\n\n${generateLifeStateGraph(connections)}`
         },
         history: formatHistoryForApi(history)
@@ -227,17 +406,13 @@ export async function getAiResponseAfterConsent(
 
     console.log("Executing tool after consent:", action);
     const functionResponsePart = await executeTool(action.toolName, action.toolArgs, connections);
-    // Fix: chat.sendMessage expects an object with a `message` property.
     const result = await chat.sendMessage({ message: [functionResponsePart] });
 
     return { text: result.text };
 }
 
-
 /**
  * Generates speech audio from the given text using the Gemini TTS model.
- * @param text The text to convert to speech.
- * @returns A base64 encoded audio string or null if an error occurs.
  */
 export async function getAiSpeech(text: string): Promise<string | null> {
     try {

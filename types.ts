@@ -11,10 +11,32 @@ export interface ServiceAccount {
   connected: boolean;
 }
 
+export interface User {
+  name: string;
+  email: string;
+  avatar: string; // URL to an image
+}
+
+export interface GroundingSource {
+    title: string;
+    uri: string;
+}
+
+export interface GeneratedVideo {
+    state: 'generating' | 'ready' | 'error';
+    url?: string;
+    operationName?: string; // To poll for status
+}
+
 export interface ChatMessage {
     author: MessageAuthor;
     text: string;
-    image?: string; // Base64 encoded image data URL
+    image?: string; // Base64 encoded image data URL from user
+    video?: string; // Base64 encoded video data URL from user
+    audio?: string; // Base64 encoded audio data URL from user
+    generatedImage?: string; // Base64 encoded image data URL from AI
+    generatedVideo?: GeneratedVideo;
+    groundingSources?: GroundingSource[];
     // For consent flow
     requiresConsent?: boolean;
     consentGranted?: boolean;
@@ -34,6 +56,9 @@ export interface ChatSession {
 // A structured response from the AI service
 export interface AiResponse {
     text: string;
+    generatedImage?: string; // Base64 encoded image data URL from AI
+    generatedVideo?: GeneratedVideo;
+    groundingSources?: GroundingSource[];
     requiresConsent?: boolean;
     action?: {
         toolName: string;
