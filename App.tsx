@@ -52,7 +52,8 @@ async function decodeAudioData(
 async function playAudio(
     base64Audio: string,
     audioContext: AudioContext,
-    sourceRef: React.MutableRefObject<AudioBufferSourceNode | null>
+    sourceRef: React.MutableRefObject<AudioBufferSourceNode | null>,
+    onEnded?: () => void
 ): Promise<void> {
     try {
         // Optimization: Use fetch to decode base64 string to ArrayBuffer off the main thread
@@ -63,7 +64,9 @@ async function playAudio(
         const audioBuffer = await decodeAudioData(arrayBuffer, audioContext, 24000, 1);
         
         if (sourceRef.current) {
-            sourceRef.current.stop();
+            try {
+                sourceRef.current.stop();
+            } catch (e) { /* ignore if already stopped */ }
             sourceRef.current.disconnect();
         }
 
@@ -76,14 +79,25 @@ async function playAudio(
             if (sourceRef.current === source) {
                 sourceRef.current = null;
             }
+            if (onEnded) onEnded();
         };
         sourceRef.current = source;
     } catch (error) {
         console.error("Error playing audio:", error);
         sourceRef.current = null;
+        if (onEnded) onEnded(); // Ensure flow continues even on error
     }
 }
 // --- End Audio Utility Functions ---
+
+// Helper to split text into manageable chunks for speech
+function splitTextIntoChunks(text: string): string[] {
+    // Clean up basic markdown which might confuse TTS or sound weird
+    const cleanText = text.replace(/\*{1,2}/g, '');
+    // Split by sentence ending punctuation (., !, ?) keeping the punctuation attached
+    const result = cleanText.match(/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g);
+    return result ? result.map(s => s.trim()).filter(s => s.length > 0) : [cleanText];
+}
 
 const App: React.FC = () => {
     const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
@@ -174,11 +188,11 @@ const App: React.FC = () => {
     }, [chatSessions, activeChatId]);
 
     const stopAudioInternal = useCallback(() => {
-        speechGenerationRef.current += 1; // Invalidate any pending generation
+        speechGenerationRef.current += 1; // Invalidate any pending generation loops
         if (audioSourceRef.current) {
             try {
                 audioSourceRef.current.stop();
-            } catch (e) { /* Ignore errors */ }
+            } catch (e) { /* Ignore errors if already stopped */ }
             audioSourceRef.current.disconnect();
             audioSourceRef.current = null;
         }
@@ -256,20 +270,52 @@ const App: React.FC = () => {
     const playAiSpeech = useCallback(async (text: string) => {
         if (!isVoiceOutputEnabled || !audioContextRef.current) return;
         
-        const currentGenId = speechGenerationRef.current; // Capture current ID
-        
-        try {
-            const base64Audio = await getAiSpeech(text);
-            
-            // Check if cancellation occurred during fetch
-            if (currentGenId !== speechGenerationRef.current) return;
+        // 1. Invalidate previous loops
+        speechGenerationRef.current += 1;
+        const currentGenId = speechGenerationRef.current;
 
-            if (base64Audio && audioContextRef.current) {
-                await playAudio(base64Audio, audioContextRef.current, audioSourceRef);
+        // 2. Split text into sentence chunks to minimize initial latency
+        const chunks = splitTextIntoChunks(text);
+
+        // 3. Sequential Playback Loop
+        // This function plays chunk[i], and when done, triggers playLoop(i+1)
+        const playLoop = async (index: number) => {
+            if (index >= chunks.length) return;
+            // Check if user cancelled/stopped during previous playback
+            if (speechGenerationRef.current !== currentGenId) return;
+
+            const chunkText = chunks[index];
+            try {
+                // Fetch audio for this specific chunk
+                const base64Audio = await getAiSpeech(chunkText);
+                
+                // Check cancellation after async fetch
+                if (speechGenerationRef.current !== currentGenId) return;
+
+                if (base64Audio && audioContextRef.current) {
+                    // Wrap playAudio in a Promise to await its completion
+                    await new Promise<void>((resolve) => {
+                         playAudio(base64Audio, audioContextRef.current!, audioSourceRef, resolve);
+                    });
+                } else {
+                     // If fetch failed, skip to next immediately
+                     playLoop(index + 1);
+                     return;
+                }
+            } catch (error) {
+                console.error("Failed to play speech chunk:", error);
+                // Try next chunk even if this one failed
+                playLoop(index + 1);
+                return;
             }
-        } catch (error) {
-            console.error("Failed to play AI speech:", error);
-        }
+
+            // Immediately start next chunk after current one finishes
+            playLoop(index + 1);
+        };
+
+        // Start the chain
+        playLoop(0);
+
     }, [isVoiceOutputEnabled]);
     
     const updateActiveChat = (updater: (prevMessages: ChatMessage[]) => ChatMessage[], chatId: string | null = activeChatId) => {
@@ -325,11 +371,18 @@ const App: React.FC = () => {
             
             if (!aiResponse.requiresConsent && !aiResponse.generatedImage && !aiResponse.generatedVideo && !aiResponse.requiresBillingProject) {
                 // Do not await the speech generation so the UI unblocks immediately
+                // The new playAiSpeech handles chunking internally
                 playAiSpeech(aiResponse.text);
             }
-        } catch (error) {
+        } catch (error: any) {
             console.error("Error getting AI response:", error);
-            const errorMessage: ChatMessage = { author: 'ai', text: "I'm sorry, I encountered an error." };
+            let errorText = "I'm sorry, I encountered an error.";
+            if (error?.status === 503 || error?.code === 503 || error?.message?.includes('overloaded')) {
+                errorText = "The AI service is currently overloaded. Please try again in a moment.";
+            } else if (error?.status === 429 || error?.code === 429) {
+                 errorText = "I'm receiving too many requests right now. Please wait a moment.";
+            }
+            const errorMessage: ChatMessage = { author: 'ai', text: errorText };
             updateActiveChat(prev => [...prev, errorMessage]);
             // Do not await error speech either
             playAiSpeech(errorMessage.text);
@@ -353,9 +406,13 @@ const App: React.FC = () => {
             updateActiveChat(prev => [...prev, aiMessage]);
             // Do not await the speech generation so the UI unblocks immediately
             playAiSpeech(aiResponse.text);
-        } catch (error) {
+        } catch (error: any) {
             console.error("Error getting AI response after consent:", error);
-            const errorMessage: ChatMessage = { author: 'ai', text: "Thank you. However, I encountered an error while proceeding." };
+            let errorText = "Thank you. However, I encountered an error while proceeding.";
+             if (error?.status === 503 || error?.code === 503 || error?.message?.includes('overloaded')) {
+                errorText = "The system is busy right now. Please try granting permission again in a moment.";
+            }
+            const errorMessage: ChatMessage = { author: 'ai', text: errorText };
             updateActiveChat(prev => [...prev, errorMessage]);
             // Do not await error speech
             playAiSpeech(errorMessage.text);

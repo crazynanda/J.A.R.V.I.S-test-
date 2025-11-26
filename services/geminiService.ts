@@ -25,6 +25,27 @@ if (!process.env.API_KEY) {
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
+// Helper function to retry operations on 503 (Overloaded) and 429 (Too Many Requests) errors
+async function retryWithBackoff<T>(operation: () => Promise<T>, retries = 3, initialDelay = 1000): Promise<T> {
+    let attempt = 0;
+    while (true) {
+        try {
+            return await operation();
+        } catch (error: any) {
+            attempt++;
+            const isOverloaded = error.status === 503 || error.code === 503 || error.message?.includes('overloaded');
+            const isRateLimited = error.status === 429 || error.code === 429;
+            
+            if (attempt > retries || (!isOverloaded && !isRateLimited)) {
+                throw error;
+            }
+            const delay = initialDelay * Math.pow(2, attempt - 1);
+            console.warn(`Service busy (Status ${error.status}). Retrying in ${delay}ms... (Attempt ${attempt})`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+}
+
 // A map of available tools the AI can call.
 const availableTools: { [key: string]: Function } = {
     getEmails,
@@ -82,7 +103,12 @@ function getMediaPart(dataUrl: string): Part | null {
 function formatHistoryForApi(history: ChatMessage[]): Content[] {
     const apiHistory: Content[] = [];
     
+    // Prune history to last 30 messages to handle "heavy input" context limits and improve latency
     let processingHistory = [...history];
+    const MAX_HISTORY_LENGTH = 30;
+    if (processingHistory.length > MAX_HISTORY_LENGTH) {
+        processingHistory = processingHistory.slice(processingHistory.length - MAX_HISTORY_LENGTH);
+    }
 
     if (processingHistory.length > 0 && processingHistory[0].author === 'ai') {
         processingHistory.shift();
@@ -234,7 +260,8 @@ export async function getAiResponse(
         }
     }
 
-    let result = await chat.sendMessage({ message: userParts });
+    // Wrapped in retry
+    let result = await retryWithBackoff<GenerateContentResponse>(() => chat.sendMessage({ message: userParts }));
     let response = result;
     const learnedFacts: string[] = [];
 
@@ -247,7 +274,8 @@ export async function getAiResponse(
             const fact = functionCall.args.fact as string;
             learnedFacts.push(fact);
             const functionResponsePart: Part = { functionResponse: { name: 'rememberFact', response: { result: "Fact remembered successfully." } } };
-            result = await chat.sendMessage({ message: [functionResponsePart] });
+            // Wrapped in retry
+            result = await retryWithBackoff<GenerateContentResponse>(() => chat.sendMessage({ message: [functionResponsePart] }));
             response = result;
             // Continue the loop to allow the AI to generate a response acknowledging the memory
             continue;
@@ -269,19 +297,21 @@ export async function getAiResponse(
             const imagePrompt = functionCall.args.prompt as string;
             const aspectRatio = functionCall.args.aspectRatio as "1:1" | "16:9" | "9:16" | "4:3" | "3:4";
              try {
-                const imageResult = await ai.models.generateImages({
+                // Wrapped in retry
+                const imageResult: any = await retryWithBackoff(() => ai.models.generateImages({
                     model: 'imagen-4.0-generate-001',
                     prompt: imagePrompt,
                     config: {
                         numberOfImages: 1,
                         aspectRatio: aspectRatio || '1:1'
                     },
-                });
+                }));
 
                 const base64ImageBytes = imageResult.generatedImages[0].image.imageBytes;
                 const imageUrl = `data:image/png;base64,${base64ImageBytes}`;
                  const functionResponsePart: Part = { functionResponse: { name: 'generateImage', response: { result: `Successfully generated image.` } } };
-                result = await chat.sendMessage({ message: [functionResponsePart] });
+                // Wrapped in retry
+                result = await retryWithBackoff<GenerateContentResponse>(() => chat.sendMessage({ message: [functionResponsePart] }));
                 return { text: result.text, generatedImage: imageUrl, learnedFacts };
              } catch (error: any) {
                  console.error("Error generating image:", error);
@@ -293,7 +323,8 @@ export async function getAiResponse(
                      };
                  }
                  const functionResponsePart: Part = { functionResponse: { name: 'generateImage', response: { error: (error as Error).message } } };
-                 result = await chat.sendMessage({ message: [functionResponsePart] });
+                 // Wrapped in retry
+                 result = await retryWithBackoff<GenerateContentResponse>(() => chat.sendMessage({ message: [functionResponsePart] }));
                  return { text: result.text, learnedFacts };
              }
         }
@@ -309,16 +340,18 @@ export async function getAiResponse(
                 const imagePart = getMediaPart(lastUserImageMsg.image);
                 if (!imagePart) throw new Error("Invalid image format for editing.");
                 
-                const imageResult = await ai.models.generateContent({
+                // Wrapped in retry
+                const imageResult = await retryWithBackoff<GenerateContentResponse>(() => ai.models.generateContent({
                     model: 'gemini-2.5-flash-image',
                     contents: { parts: [imagePart, { text: imagePrompt }] },
                     config: { responseModalities: [Modality.IMAGE] },
-                });
+                }));
                 const resultPart = imageResult.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
                 if (resultPart?.inlineData) {
                     const imageUrl = `data:${resultPart.inlineData.mimeType};base64,${resultPart.inlineData.data}`;
                     const functionResponsePart: Part = { functionResponse: { name: 'editImage', response: { result: "Successfully edited the image." } } };
-                    result = await chat.sendMessage({ message: [functionResponsePart] });
+                    // Wrapped in retry
+                    result = await retryWithBackoff<GenerateContentResponse>(() => chat.sendMessage({ message: [functionResponsePart] }));
                     return { text: result.text, generatedImage: imageUrl, learnedFacts };
                 } else {
                     throw new Error("No edited image data received.");
@@ -326,7 +359,8 @@ export async function getAiResponse(
              } catch(error) {
                 console.error("Error editing image:", error);
                 const functionResponsePart: Part = { functionResponse: { name: 'editImage', response: { error: (error as Error).message } } };
-                result = await chat.sendMessage({ message: [functionResponsePart] });
+                // Wrapped in retry
+                result = await retryWithBackoff<GenerateContentResponse>(() => chat.sendMessage({ message: [functionResponsePart] }));
                 return { text: result.text, learnedFacts };
              }
         }
@@ -360,10 +394,12 @@ export async function getAiResponse(
                     },
                 };
                 
+                // Wrapped in retry
                 // @ts-ignore
-                const operation = await localAi.models.generateVideos(request);
+                const operation: any = await retryWithBackoff(() => localAi.models.generateVideos(request));
                 const functionResponsePart: Part = { functionResponse: { name: 'generateVideo', response: { result: `Starting video generation. This may take a few minutes.` } } };
-                result = await chat.sendMessage({ message: [functionResponsePart] });
+                // Wrapped in retry
+                result = await retryWithBackoff<GenerateContentResponse>(() => chat.sendMessage({ message: [functionResponsePart] }));
                 return {
                     text: result.text,
                     generatedVideo: { state: 'generating', operationName: operation.name },
@@ -373,7 +409,8 @@ export async function getAiResponse(
              } catch (error) {
                  console.error("Error starting video generation:", error);
                  const functionResponsePart: Part = { functionResponse: { name: 'generateVideo', response: { error: (error as Error).message } } };
-                 result = await chat.sendMessage({ message: [functionResponsePart] });
+                 // Wrapped in retry
+                 result = await retryWithBackoff<GenerateContentResponse>(() => chat.sendMessage({ message: [functionResponsePart] }));
                  return { text: result.text, learnedFacts };
              }
         }
@@ -391,11 +428,12 @@ export async function getAiResponse(
                  } catch (e) { /* fail silently, proceed without location */ }
              }
 
-             const groundingResult = await ai.models.generateContent({
+             // Wrapped in retry
+             const groundingResult = await retryWithBackoff<GenerateContentResponse>(() => ai.models.generateContent({
                  model: 'gemini-2.5-flash',
                  contents: userParts,
                  config: groundingConfig
-             });
+             }));
              
              const groundingChunks = groundingResult.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
              const sources: GroundingSource[] = groundingChunks.map((chunk: any) => ({
@@ -408,7 +446,8 @@ export async function getAiResponse(
 
         // --- REGULAR TOOL HANDLING ---
         const functionResponsePart = await executeTool(functionCall.name, functionCall.args, connections);
-        result = await chat.sendMessage({ message: [functionResponsePart] });
+        // Wrapped in retry
+        result = await retryWithBackoff<GenerateContentResponse>(() => chat.sendMessage({ message: [functionResponsePart] }));
         response = result;
     }
 
@@ -435,7 +474,8 @@ export async function getAiResponseAfterConsent(
 
     console.log("Executing tool after consent:", action);
     const functionResponsePart = await executeTool(action.toolName, action.toolArgs, connections);
-    const result = await chat.sendMessage({ message: [functionResponsePart] });
+    // Wrapped in retry
+    const result = await retryWithBackoff<GenerateContentResponse>(() => chat.sendMessage({ message: [functionResponsePart] }));
 
     return { text: result.text };
 }
@@ -445,7 +485,8 @@ export async function getAiResponseAfterConsent(
  */
 export async function getAiSpeech(text: string): Promise<string | null> {
     try {
-        const response = await ai.models.generateContent({
+        // Wrapped in retry
+        const response = await retryWithBackoff<GenerateContentResponse>(() => ai.models.generateContent({
             model: "gemini-2.5-flash-preview-tts",
             contents: [{ parts: [{ text: `Speak the following text: ${text}` }] }],
             config: {
@@ -456,7 +497,7 @@ export async function getAiSpeech(text: string): Promise<string | null> {
                     },
                 },
             },
-        });
+        }));
 
         const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
         if (!base64Audio) {
