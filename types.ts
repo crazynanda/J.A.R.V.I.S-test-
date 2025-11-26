@@ -44,6 +44,8 @@ export interface ChatMessage {
         toolName: string;
         toolArgs: any;
     };
+    // For billing flow
+    requiresBillingProject?: boolean;
 }
 
 // Represents a single, continuous conversation.
@@ -64,6 +66,7 @@ export interface AiResponse {
         toolName: string;
         toolArgs: any;
     };
+    requiresBillingProject?: boolean;
 }
 
 export interface ServiceIntegration {

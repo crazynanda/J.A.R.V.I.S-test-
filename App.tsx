@@ -17,32 +17,31 @@ const CHAT_SESSIONS_KEY = 'jarvis-chat-sessions';
 const VOICE_ENABLED_KEY = 'jarvis-voice-enabled';
 
 // --- Audio Utility Functions ---
-// Decodes a base64 string into a Uint8Array.
-function decode(base64: string): Uint8Array {
-    const binaryString = atob(base64);
-    const len = binaryString.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-    }
-    return bytes;
-}
 
 // Decodes raw PCM audio data into an AudioBuffer for playback.
+// Optimized: Processes in chunks to yield to the main thread, keeping UI responsive.
 async function decodeAudioData(
-    data: Uint8Array,
+    arrayBuffer: ArrayBuffer,
     ctx: AudioContext,
     sampleRate: number,
     numChannels: number,
 ): Promise<AudioBuffer> {
-    const dataInt16 = new Int16Array(data.buffer);
+    const dataInt16 = new Int16Array(arrayBuffer);
     const frameCount = dataInt16.length / numChannels;
     const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
 
+    // Process in chunks to prevent blocking the UI thread on large responses
+    const chunkSize = 50000; 
     for (let channel = 0; channel < numChannels; channel++) {
         const channelData = buffer.getChannelData(channel);
-        for (let i = 0; i < frameCount; i++) {
-            channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+        for (let i = 0; i < frameCount; i += chunkSize) {
+            const end = Math.min(i + chunkSize, frameCount);
+            for (let j = i; j < end; j++) {
+                // Convert PCM Int16 to Float32
+                channelData[j] = dataInt16[j * numChannels + channel] / 32768.0;
+            }
+            // Yield to the main thread to allow UI updates (typing, clicking)
+            await new Promise(resolve => setTimeout(resolve, 0));
         }
     }
     return buffer;
@@ -55,8 +54,12 @@ async function playAudio(
     sourceRef: React.MutableRefObject<AudioBufferSourceNode | null>
 ): Promise<void> {
     try {
-        const decodedBytes = decode(base64Audio);
-        const audioBuffer = await decodeAudioData(decodedBytes, audioContext, 24000, 1);
+        // Optimization: Use fetch to decode base64 string to ArrayBuffer off the main thread
+        // This avoids the CPU-heavy `atob` and manual loop for the initial decode
+        const response = await fetch(`data:audio/pcm;base64,${base64Audio}`);
+        const arrayBuffer = await response.arrayBuffer();
+
+        const audioBuffer = await decodeAudioData(arrayBuffer, audioContext, 24000, 1);
         
         if (sourceRef.current) {
             sourceRef.current.stop();
@@ -100,12 +103,16 @@ const App: React.FC = () => {
     const [isInitializing, setIsInitializing] = useState(true);
     const [user, setUser] = useState<User | null>(null);
     const [isProfileOpen, setIsProfileOpen] = useState(false);
-    const [isVeoKeyNeeded, setIsVeoKeyNeeded] = useState(false);
+    // Renamed from isVeoKeyNeeded to covers both Veo and Imagen
+    const [isProjectKeyNeeded, setIsProjectKeyNeeded] = useState(false);
     const [isLiveModeOpen, setIsLiveModeOpen] = useState(false);
 
     const audioContextRef = useRef<AudioContext | null>(null);
     const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
     const profileRef = useRef<HTMLDivElement>(null);
+    
+    // Track the current speech generation request to handle cancellation
+    const speechGenerationRef = useRef(0);
 
     // Load sessions from localStorage on initial render
     useEffect(() => {
@@ -151,6 +158,7 @@ const App: React.FC = () => {
     }, [chatSessions, activeChatId]);
 
     const stopAudioInternal = useCallback(() => {
+        speechGenerationRef.current += 1; // Invalidate any pending generation
         if (audioSourceRef.current) {
             try {
                 audioSourceRef.current.stop();
@@ -211,7 +219,7 @@ const App: React.FC = () => {
                 );
                 // @ts-ignore
                 if (window.aistudio && await window.aistudio.hasSelectedApiKey() === false) {
-                    setIsVeoKeyNeeded(true);
+                    setIsProjectKeyNeeded(true);
                 }
             } catch (error) {
                 console.error("Failed to discover device accounts:", error);
@@ -231,8 +239,15 @@ const App: React.FC = () => {
 
     const playAiSpeech = useCallback(async (text: string) => {
         if (!isVoiceOutputEnabled || !audioContextRef.current) return;
+        
+        const currentGenId = speechGenerationRef.current; // Capture current ID
+        
         try {
             const base64Audio = await getAiSpeech(text);
+            
+            // Check if cancellation occurred during fetch
+            if (currentGenId !== speechGenerationRef.current) return;
+
             if (base64Audio && audioContextRef.current) {
                 await playAudio(base64Audio, audioContextRef.current, audioSourceRef);
             }
@@ -273,17 +288,25 @@ const App: React.FC = () => {
                 groundingSources: aiResponse.groundingSources,
                 requiresConsent: aiResponse.requiresConsent,
                 action: aiResponse.action,
+                requiresBillingProject: aiResponse.requiresBillingProject
             };
+            
+            if (aiResponse.requiresBillingProject) {
+                setIsProjectKeyNeeded(true);
+            }
+
             updateActiveChat(prev => [...prev, aiMessage]);
             
-            if (!aiResponse.requiresConsent && !aiResponse.generatedImage && !aiResponse.generatedVideo) {
-                await playAiSpeech(aiResponse.text);
+            if (!aiResponse.requiresConsent && !aiResponse.generatedImage && !aiResponse.generatedVideo && !aiResponse.requiresBillingProject) {
+                // Do not await the speech generation so the UI unblocks immediately
+                playAiSpeech(aiResponse.text);
             }
         } catch (error) {
             console.error("Error getting AI response:", error);
             const errorMessage: ChatMessage = { author: 'ai', text: "I'm sorry, I encountered an error." };
             updateActiveChat(prev => [...prev, errorMessage]);
-            await playAiSpeech(errorMessage.text);
+            // Do not await error speech either
+            playAiSpeech(errorMessage.text);
         } finally {
             setIsLoading(false);
         }
@@ -302,12 +325,14 @@ const App: React.FC = () => {
             const aiResponse = await getAiResponseAfterConsent(messageToApprove.action, historyUpToConsentRequest, integrations);
             const aiMessage: ChatMessage = { author: 'ai', text: aiResponse.text };
             updateActiveChat(prev => [...prev, aiMessage]);
-            await playAiSpeech(aiResponse.text);
+            // Do not await the speech generation so the UI unblocks immediately
+            playAiSpeech(aiResponse.text);
         } catch (error) {
             console.error("Error getting AI response after consent:", error);
             const errorMessage: ChatMessage = { author: 'ai', text: "Thank you. However, I encountered an error while proceeding." };
             updateActiveChat(prev => [...prev, errorMessage]);
-            await playAiSpeech(errorMessage.text);
+            // Do not await error speech
+            playAiSpeech(errorMessage.text);
         } finally {
             setIsLoading(false);
         }
@@ -425,14 +450,14 @@ const App: React.FC = () => {
         setIsHistoryPanelOpen(false);
     }, []);
     
-    const handleSelectVeoKey = async () => {
+    const handleSelectProjectKey = async () => {
         // @ts-ignore
         if (window.aistudio) {
             // @ts-ignore
             await window.aistudio.openSelectKey();
-            setIsVeoKeyNeeded(false);
+            setIsProjectKeyNeeded(false);
             // We can optionally add a message to the chat to inform the user to try again
-             const infoMessage: ChatMessage = { author: 'ai', text: "Your project has been configured. Please try your video generation request again." };
+             const infoMessage: ChatMessage = { author: 'ai', text: "Your project has been configured. Please try your generation request again." };
             updateActiveChat(prev => [...prev, infoMessage]);
         }
     };
@@ -530,8 +555,8 @@ const App: React.FC = () => {
                     isLoading={isLoading}
                     onSendMessage={handleSendMessage}
                     onConsent={handleConsent}
-                    isVeoKeyNeeded={isVeoKeyNeeded}
-                    onSelectVeoKey={handleSelectVeoKey}
+                    isProjectKeyNeeded={isProjectKeyNeeded}
+                    onSelectProjectKey={handleSelectProjectKey}
                 />
             </main>
             

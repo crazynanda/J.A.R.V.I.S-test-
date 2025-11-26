@@ -266,8 +266,14 @@ export async function getAiResponse(
                  const functionResponsePart: Part = { functionResponse: { name: 'generateImage', response: { result: `Successfully generated image.` } } };
                 result = await chat.sendMessage({ message: [functionResponsePart] });
                 return { text: result.text, generatedImage: imageUrl };
-             } catch (error) {
+             } catch (error: any) {
                  console.error("Error generating image:", error);
+                 if (error.message?.includes('billed users') || error.status === 400 || error.code === 400) {
+                     return { 
+                         text: "To generate images, you need to select a billing project. Please use the button above to configure your project.", 
+                         requiresBillingProject: true 
+                     };
+                 }
                  const functionResponsePart: Part = { functionResponse: { name: 'generateImage', response: { error: (error as Error).message } } };
                  result = await chat.sendMessage({ message: [functionResponsePart] });
                  return { text: result.text };
@@ -318,7 +324,10 @@ export async function getAiResponse(
              try {
                  // @ts-ignore
                  if (window.aistudio && await window.aistudio.hasSelectedApiKey() === false) {
-                    return { text: "To generate a video, you first need to select a project. Please click the 'Select Project' button to continue." };
+                    return { 
+                        text: "To generate a video, you first need to select a project. Please click the 'Select Project' button to continue.",
+                        requiresBillingProject: true
+                    };
                  }
 
                 const localAi = new GoogleGenAI({ apiKey: process.env.API_KEY });
