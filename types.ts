@@ -67,6 +67,7 @@ export interface AiResponse {
         toolArgs: any;
     };
     requiresBillingProject?: boolean;
+    learnedFacts?: string[]; // New facts learned during this interaction
 }
 
 export interface ServiceIntegration {

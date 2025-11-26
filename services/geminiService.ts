@@ -1,7 +1,7 @@
 
 import { GoogleGenAI, Modality, type Content, GenerateContentResponse, Tool, Part, Type } from "@google/genai";
 import { type ChatMessage, type AiResponse, type ServiceIntegration, GroundingSource, GeneratedVideo } from '../types';
-import { AI_PERSONA_INSTRUCTIONS, generateLifeStateGraph } from '../constants';
+import { AI_PERSONA_INSTRUCTIONS, generateSystemInstruction, generateLifeStateGraph } from '../constants';
 import { 
     getEmails, getEmailsFunctionDeclaration,
     requestPermissionFunctionDeclaration,
@@ -16,6 +16,7 @@ import {
     useGoogleMapsFunctionDeclaration,
     requestLocationFunctionDeclaration,
     getUserLocation,
+    rememberFactFunctionDeclaration,
 } from './mockDataService';
 
 if (!process.env.API_KEY) {
@@ -35,6 +36,8 @@ const availableTools: { [key: string]: Function } = {
     // These are placeholders for the AI to signal intent for grounding
     useGoogleSearch: async () => ({ result: "Now searching Google..."}),
     useGoogleMaps: async () => ({ result: "Now searching Google Maps..."}),
+    // The rememberFact tool logic is handled directly in the loop to pass data back to App state
+    rememberFact: async () => ({ result: "Fact remembered." }),
 };
 
 const functionDeclarations = [
@@ -50,6 +53,7 @@ const functionDeclarations = [
     useGoogleSearchFunctionDeclaration,
     useGoogleMapsFunctionDeclaration,
     requestLocationFunctionDeclaration,
+    rememberFactFunctionDeclaration,
 ];
 
 /**
@@ -201,14 +205,15 @@ export async function getAiResponse(
     media: { type: 'image' | 'video' | 'audio', data: string } | undefined,
     options: { aspectRatio?: string } | undefined,
     history: ChatMessage[],
-    connections: ServiceIntegration[]
+    connections: ServiceIntegration[],
+    userMemory: string[] = [] // New parameter for Long-Term Memory
 ): Promise<AiResponse> {
     const modelName = selectModel(prompt, media);
     console.log(`Using model: ${modelName}`);
 
     const config: any = {
         tools: [{ functionDeclarations }],
-        systemInstruction: `${AI_PERSONA_INSTRUCTIONS}\n\n${generateLifeStateGraph(connections)}`
+        systemInstruction: generateSystemInstruction(connections, userMemory)
     };
 
     if (modelName === 'gemini-2.5-pro') {
@@ -231,12 +236,23 @@ export async function getAiResponse(
 
     let result = await chat.sendMessage({ message: userParts });
     let response = result;
+    const learnedFacts: string[] = [];
 
     while (response.functionCalls && response.functionCalls.length > 0) {
         const functionCall = response.functionCalls[0];
         console.log("AI wants to call a tool:", functionCall);
 
         // --- SPECIAL TOOL HANDLING ---
+        if (functionCall.name === 'rememberFact') {
+            const fact = functionCall.args.fact as string;
+            learnedFacts.push(fact);
+            const functionResponsePart: Part = { functionResponse: { name: 'rememberFact', response: { result: "Fact remembered successfully." } } };
+            result = await chat.sendMessage({ message: [functionResponsePart] });
+            response = result;
+            // Continue the loop to allow the AI to generate a response acknowledging the memory
+            continue;
+        }
+
         if (functionCall.name === 'requestPermission') {
             return {
                 text: functionCall.args.reason as string,
@@ -244,7 +260,8 @@ export async function getAiResponse(
                 action: {
                     toolName: functionCall.args.toolToCall as string,
                     toolArgs: functionCall.args.toolArgs || {}
-                }
+                },
+                learnedFacts
             };
         }
         
@@ -265,18 +282,19 @@ export async function getAiResponse(
                 const imageUrl = `data:image/png;base64,${base64ImageBytes}`;
                  const functionResponsePart: Part = { functionResponse: { name: 'generateImage', response: { result: `Successfully generated image.` } } };
                 result = await chat.sendMessage({ message: [functionResponsePart] });
-                return { text: result.text, generatedImage: imageUrl };
+                return { text: result.text, generatedImage: imageUrl, learnedFacts };
              } catch (error: any) {
                  console.error("Error generating image:", error);
                  if (error.message?.includes('billed users') || error.status === 400 || error.code === 400) {
                      return { 
                          text: "To generate images, you need to select a billing project. Please use the button above to configure your project.", 
-                         requiresBillingProject: true 
+                         requiresBillingProject: true,
+                         learnedFacts
                      };
                  }
                  const functionResponsePart: Part = { functionResponse: { name: 'generateImage', response: { error: (error as Error).message } } };
                  result = await chat.sendMessage({ message: [functionResponsePart] });
-                 return { text: result.text };
+                 return { text: result.text, learnedFacts };
              }
         }
         
@@ -285,7 +303,7 @@ export async function getAiResponse(
              // Find the last user message with an image to edit
              const lastUserImageMsg = [...history].reverse().find(m => m.author === 'user' && m.image);
              if (!lastUserImageMsg || !lastUserImageMsg.image) {
-                 return { text: "I'm sorry, I couldn't find an image to edit. Please upload one first." };
+                 return { text: "I'm sorry, I couldn't find an image to edit. Please upload one first.", learnedFacts };
              }
              try {
                 const imagePart = getMediaPart(lastUserImageMsg.image);
@@ -301,7 +319,7 @@ export async function getAiResponse(
                     const imageUrl = `data:${resultPart.inlineData.mimeType};base64,${resultPart.inlineData.data}`;
                     const functionResponsePart: Part = { functionResponse: { name: 'editImage', response: { result: "Successfully edited the image." } } };
                     result = await chat.sendMessage({ message: [functionResponsePart] });
-                    return { text: result.text, generatedImage: imageUrl };
+                    return { text: result.text, generatedImage: imageUrl, learnedFacts };
                 } else {
                     throw new Error("No edited image data received.");
                 }
@@ -309,7 +327,7 @@ export async function getAiResponse(
                 console.error("Error editing image:", error);
                 const functionResponsePart: Part = { functionResponse: { name: 'editImage', response: { error: (error as Error).message } } };
                 result = await chat.sendMessage({ message: [functionResponsePart] });
-                return { text: result.text };
+                return { text: result.text, learnedFacts };
              }
         }
         
@@ -326,7 +344,8 @@ export async function getAiResponse(
                  if (window.aistudio && await window.aistudio.hasSelectedApiKey() === false) {
                     return { 
                         text: "To generate a video, you first need to select a project. Please click the 'Select Project' button to continue.",
-                        requiresBillingProject: true
+                        requiresBillingProject: true,
+                        learnedFacts
                     };
                  }
 
@@ -347,14 +366,15 @@ export async function getAiResponse(
                 result = await chat.sendMessage({ message: [functionResponsePart] });
                 return {
                     text: result.text,
-                    generatedVideo: { state: 'generating', operationName: operation.name }
+                    generatedVideo: { state: 'generating', operationName: operation.name },
+                    learnedFacts
                 };
 
              } catch (error) {
                  console.error("Error starting video generation:", error);
                  const functionResponsePart: Part = { functionResponse: { name: 'generateVideo', response: { error: (error as Error).message } } };
                  result = await chat.sendMessage({ message: [functionResponsePart] });
-                 return { text: result.text };
+                 return { text: result.text, learnedFacts };
              }
         }
         
@@ -383,7 +403,7 @@ export async function getAiResponse(
                  title: chunk.web?.title || chunk.maps?.title || 'Source'
              })).filter((s: GroundingSource) => s.uri);
              
-             return { text: groundingResult.text, groundingSources: sources };
+             return { text: groundingResult.text, groundingSources: sources, learnedFacts };
         }
 
         // --- REGULAR TOOL HANDLING ---
@@ -392,7 +412,7 @@ export async function getAiResponse(
         response = result;
     }
 
-    return { text: response.text };
+    return { text: response.text, learnedFacts };
 }
 
 

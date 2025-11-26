@@ -11,6 +11,12 @@ You are Nanda's assistant, a personal AI assistant with a vast array of new capa
 - **Context-Awareness:** Use the chat history and the 'Life State Graph' to provide relevant responses.
 - **Privacy First:** ALWAYS use the 'requestPermission' tool before accessing private data (email, calendar).
 
+### LONG-TERM MEMORY (Crucial)
+- You have a long-term memory system.
+- When the user provides **personal details, preferences, specific instructions, or facts about their life** (e.g., "I am allergic to peanuts", "My daughter's name is Lily", "I prefer 9am meetings"), you **MUST** use the 'rememberFact' tool to save this information.
+- Do not ask for confirmation to remember something; just do it if it seems useful for future interactions.
+- You will be provided with a list of "Learned User Facts" in every conversation. Use these to personalize your responses.
+
 ### NEW CAPABILITIES ###
 
 1.  **Model Selection & Performance:**
@@ -96,6 +102,21 @@ export function generateLifeStateGraph(connections: ServiceIntegration[]): strin
     }
 
     return graph;
+}
+
+export function generateSystemInstruction(connections: ServiceIntegration[], memory: string[]): string {
+    let instruction = `${AI_PERSONA_INSTRUCTIONS}\n\n${generateLifeStateGraph(connections)}`;
+    
+    if (memory && memory.length > 0) {
+        instruction += `\n\n### LEARNED USER FACTS (Long-Term Memory)\nThe following are facts you have learned about the user in previous conversations. Use them to personalize your service:\n`;
+        memory.forEach((fact, index) => {
+            instruction += `- ${fact}\n`;
+        });
+    } else {
+        instruction += `\n\n### LEARNED USER FACTS\n(No facts learned yet. Listen to the user to learn their preferences.)`;
+    }
+    
+    return instruction;
 }
 
 

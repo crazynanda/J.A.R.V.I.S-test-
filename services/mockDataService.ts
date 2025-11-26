@@ -144,6 +144,18 @@ export const requestPermissionFunctionDeclaration: FunctionDeclaration = {
     }
 };
 
+export const rememberFactFunctionDeclaration: FunctionDeclaration = {
+    name: 'rememberFact',
+    description: "Saves a piece of information about the user or their preferences to your long-term memory. Use this whenever the user tells you something they want you to remember (e.g., names, favorites, life goals, specific instructions) or when you learn a significant fact about them.",
+    parameters: {
+        type: Type.OBJECT,
+        properties: {
+            fact: { type: Type.STRING, description: "The specific fact or preference to remember. Be concise." }
+        },
+        required: ['fact']
+    }
+};
+
 export const getEmailsFunctionDeclaration: FunctionDeclaration = { name: 'getEmails', description: "Fetches the user's unread emails.", parameters: { type: Type.OBJECT, properties: { accountIds: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Optional. Specific email accounts to check." } } } };
 export const getCalendarEventsFunctionDeclaration: FunctionDeclaration = { name: 'getCalendarEvents', description: "Fetches today's upcoming calendar events.", parameters: { type: Type.OBJECT, properties: {} } };
 export const createCalendarEventFunctionDeclaration: FunctionDeclaration = { name: 'createCalendarEvent', description: "Creates a new event in the user's calendar.", parameters: { type: Type.OBJECT, properties: { title: { type: Type.STRING, description: "The title of the event." }, date: { type: Type.STRING, description: "The date of the event." }, time: { type: Type.STRING, description: "The time of the event." } }, required: ['title', 'date', 'time'] } };

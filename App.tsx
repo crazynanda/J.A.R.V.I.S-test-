@@ -15,6 +15,7 @@ import { LiveConversationModal } from './components/LiveConversationModal';
 // --- Local Storage Keys ---
 const CHAT_SESSIONS_KEY = 'jarvis-chat-sessions';
 const VOICE_ENABLED_KEY = 'jarvis-voice-enabled';
+const USER_MEMORY_KEY = 'jarvis-user-memory';
 
 // --- Audio Utility Functions ---
 
@@ -106,6 +107,7 @@ const App: React.FC = () => {
     // Renamed from isVeoKeyNeeded to covers both Veo and Imagen
     const [isProjectKeyNeeded, setIsProjectKeyNeeded] = useState(false);
     const [isLiveModeOpen, setIsLiveModeOpen] = useState(false);
+    const [userMemory, setUserMemory] = useState<string[]>([]);
 
     const audioContextRef = useRef<AudioContext | null>(null);
     const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
@@ -114,7 +116,7 @@ const App: React.FC = () => {
     // Track the current speech generation request to handle cancellation
     const speechGenerationRef = useRef(0);
 
-    // Load sessions from localStorage on initial render
+    // Load sessions and memory from localStorage on initial render
     useEffect(() => {
         try {
             const savedSessions = localStorage.getItem(CHAT_SESSIONS_KEY);
@@ -130,9 +132,14 @@ const App: React.FC = () => {
             } else {
                 handleNewChat(); // Create a new chat if no storage found
             }
+
+            const savedMemory = localStorage.getItem(USER_MEMORY_KEY);
+            if (savedMemory) {
+                setUserMemory(JSON.parse(savedMemory));
+            }
         } catch (error)
         {
-            console.error('Failed to load chat history:', error);
+            console.error('Failed to load chat history or memory:', error);
             handleNewChat(); // Start fresh if loading fails
         }
     }, []);
@@ -152,6 +159,15 @@ const App: React.FC = () => {
             console.error('Failed to save chat history:', error);
         }
     }, [chatSessions, isInitializing]);
+
+    // Save memory to localStorage whenever it changes
+    useEffect(() => {
+        try {
+            localStorage.setItem(USER_MEMORY_KEY, JSON.stringify(userMemory));
+        } catch (error) {
+            console.error('Failed to save user memory:', error);
+        }
+    }, [userMemory]);
 
     const activeChat = useMemo(() => {
         return chatSessions.find(chat => chat.id === activeChatId);
@@ -279,7 +295,8 @@ const App: React.FC = () => {
         setIsLoading(true);
 
         try {
-            const aiResponse = await getAiResponse(text, media, options, activeChat.messages, integrations);
+            // Pass the current userMemory to the service to inject into the AI's system prompt
+            const aiResponse = await getAiResponse(text, media, options, activeChat.messages, integrations, userMemory);
             const aiMessage: ChatMessage = { 
                 author: 'ai', 
                 text: aiResponse.text,
@@ -293,6 +310,15 @@ const App: React.FC = () => {
             
             if (aiResponse.requiresBillingProject) {
                 setIsProjectKeyNeeded(true);
+            }
+            
+            // Update Long-Term Memory if the AI learned new facts
+            if (aiResponse.learnedFacts && aiResponse.learnedFacts.length > 0) {
+                setUserMemory(prev => {
+                    const newMemory = [...prev, ...(aiResponse.learnedFacts || [])];
+                    // Remove duplicates just in case
+                    return [...new Set(newMemory)];
+                });
             }
 
             updateActiveChat(prev => [...prev, aiMessage]);
@@ -310,7 +336,7 @@ const App: React.FC = () => {
         } finally {
             setIsLoading(false);
         }
-    }, [activeChat, integrations, stopAudioInternal, playAiSpeech, activeChatId]);
+    }, [activeChat, integrations, stopAudioInternal, playAiSpeech, activeChatId, userMemory]);
 
     const handleConsent = useCallback(async (messageToApprove: ChatMessage) => {
         if (!messageToApprove.action || !activeChat) return;
